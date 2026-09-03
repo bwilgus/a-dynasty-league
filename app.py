@@ -1,111 +1,200 @@
+import sqlite3
 import pandas as pd
-from pandas.api.types import is_numeric_dtype
-from espn_api.football import League
-from datetime import datetime, timedelta
-from sqlalchemy import create_engine
-from itertools import groupby
 import streamlit as st
-from helper_defs import get_sleeper_league_id
-from config import sleeper_league_id
-from config import sleeper_user_id
-import requests
 
-league_ids = {2024:sleeper_league_id}
-year = 2025
-url = 'https://api.sleeper.app/v1/'
+DB_PATH = "dynasty_data.db"
 
-#Get each year's league ID
-while True:
-    id = get_sleeper_league_id(league_ids[year-1], sleeper_user_id, year)
-    if id == None:
-        break
+st.set_page_config(
+    page_title="Dynasty League Hub",
+    page_icon="🏈",
+    layout="wide"
+)
+
+
+def get_connection():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+# --- Database Queries with Streamlit Caching ---
+@st.cache_data(ttl=600)
+def load_standings():
+    conn = get_connection()
+    query = """
+        SELECT 
+            s.year,
+            COALESCE(o.real_name, t.owner) AS manager_name,
+            t.team_name,
+            s.wins,
+            s.losses,
+            s.ties,
+            s.points_for,
+            s.points_against,
+            s.max_pf
+        FROM standings s
+        JOIN teams t ON s.year = t.year AND s.team_id = t.team_id
+        LEFT JOIN owners o ON t.owner = o.username
+        ORDER BY s.year DESC, s.wins DESC, s.points_for DESC;
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=600)
+def load_manager_efficiency():
+    conn = get_connection()
+    query = """
+        SELECT 
+            m.year,
+            m.week,
+            COALESCE(o.real_name, t.owner) AS manager_name,
+            t.team_name,
+            m.actual_score,
+            m.optimal_score,
+            m.efficiency_pct,
+            ROUND(m.optimal_score - m.actual_score, 2) AS bench_points_lost
+        FROM manager_efficiency m
+        JOIN teams t ON m.year = t.year AND m.team_id = t.team_id
+        LEFT JOIN owners o ON t.owner = o.username
+        ORDER BY m.year DESC, m.week DESC;
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=600)
+def load_draft_picks():
+    conn = get_connection()
+    query = """
+        SELECT 
+            d.year,
+            d.round,
+            d.pick_no,
+            d.player_name,
+            d.position,
+            d.nfl_team,
+            COALESCE(o.real_name, d.original_roster) AS drafted_by
+        FROM draft_picks d
+        LEFT JOIN owners o ON d.original_roster = o.username
+        ORDER BY d.year DESC, d.round ASC, d.pick_no ASC;
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+# --- UI & Layout ---
+st.title("🏈 Dynasty League Dashboard")
+
+tab_standings, tab_eff, tab_draft = st.tabs(["Standings & Records", "Manager Efficiency", "Rookie Drafts"])
+
+# --- TAB 1: Standings ---
+with tab_standings:
+    standings_df = load_standings()
+    if not standings_df.empty:
+        years = sorted(standings_df["year"].unique(), reverse=True)
+        selected_year = st.selectbox("Select Season", years, key="standings_year")
+        
+        filtered_standings = standings_df[standings_df["year"] == selected_year].copy()
+        
+        # Season KPIs
+        col1, col2, col3 = st.columns(3)
+        top_pf = filtered_standings.loc[filtered_standings["points_for"].idxmax()]
+        col1.metric("Points Leader", top_pf["manager_name"], f"{top_pf['points_for']} PF")
+
+        top_max = filtered_standings.loc[filtered_standings["max_pf"].idxmax()]
+        col2.metric("Max PF Leader", top_max["manager_name"], f"{top_max['max_pf']} Max PF")
+
+        most_wins = filtered_standings.loc[filtered_standings["wins"].idxmax()]
+        col3.metric("Top Record", most_wins["manager_name"], f"{most_wins['wins']}-{most_wins['losses']}")
+
+        st.divider()
+        
+        display_standings = filtered_standings[[
+            "manager_name", "team_name", "wins", "losses", "ties", "points_for", "points_against", "max_pf"
+        ]].rename(columns={
+            "manager_name": "Manager",
+            "team_name": "Team",
+            "wins": "W",
+            "losses": "L",
+            "ties": "T",
+            "points_for": "PF",
+            "points_against": "PA",
+            "max_pf": "Max PF"
+        })
+        st.dataframe(display_standings, use_container_width=True, hide_index=True)
     else:
-        league_ids[year] = get_sleeper_league_id(league_ids[year-1], sleeper_user_id, year)
-        year+=1
+        st.info("No standings records found in the database.")
 
-#Teams
-teams_year = []
-teams_owner = []
-teams_team_id = []
-teams_team_name = []
+# --- TAB 2: Manager Efficiency ---
+with tab_eff:
+    eff_df = load_manager_efficiency()
+    if not eff_df.empty:
+        eff_years = sorted(eff_df["year"].unique(), reverse=True)
+        selected_eff_year = st.selectbox("Select Season", eff_years, key="eff_year")
+        year_eff = eff_df[eff_df["year"] == selected_eff_year]
 
-#Games
-games_year = []
-games_week = []
-games_game_id = []
-games_team_id = []
-games_opponent_team_id = []
-games_team_score = []
-games_team_projected_score = []
-games_is_playoff = []
-games_is_win = []
-games_is_tie = []
-games_is_loss = []
+        # Aggregate season manager skill
+        manager_summary = year_eff.groupby("manager_name").agg(
+            avg_efficiency=("efficiency_pct", "mean"),
+            total_points_lost=("bench_points_lost", "sum")
+        ).reset_index().sort_values(by="avg_efficiency", ascending=False)
 
-#Drafts
-drafts_year = []
-drafts_pick = []
-drafts_team_id = []
-drafts_player_name = []
-drafts_player_position = []
-drafts_nfl_team = []
-drafts_traded_from = []
+        st.subheader("Season Lineup Setting Efficiency")
+        st.dataframe(
+            manager_summary.rename(columns={
+                "manager_name": "Manager",
+                "avg_efficiency": "Avg Efficiency %",
+                "total_points_lost": "Total Bench Points Wasted"
+            }).style.format({
+                "Avg Efficiency %": "{:.2f}%",
+                "Total Bench Points Wasted": "{:.2f}"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
 
-#Lineups
-lineups_year = []
-lineups_week = []
-lineups_game_id = []
-lineups_team_id = []
-lineups_player_id = []
-lineups_player_name = []
-lineups_player_position = []
-lineups_player_slot = []
-lineups_player_status = []
-lineups_player_score = []
-lineups_player_projected_score = []
+        st.divider()
+        st.subheader("Weekly Breakdown")
+        st.dataframe(
+            year_eff[[
+                "week", "manager_name", "actual_score", "optimal_score", "efficiency_pct", "bench_points_lost"
+            ]].rename(columns={
+                "week": "Week",
+                "manager_name": "Manager",
+                "actual_score": "Actual Score",
+                "optimal_score": "Optimal Score",
+                "efficiency_pct": "Efficiency %",
+                "bench_points_lost": "Bench Pts Lost"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No manager efficiency records found in the database.")
 
-#Power Rankings - TBD
-
-#Transactions - TBD
-transactions_transaction_id = []
-
-#Divisions
-divisions_year = []
-divisions_division_id = []
-divisions_division_name = []
-divisions_team_id = []
-
-#Champions
-champions_year = []
-champions_team_id = []
-champions_team_name = []
-
-#Eras
-
-#Records
-
-
-
-for year in league_ids.keys():
-    #Team Information
-
-
-    #Games Information
-
-    #Draft Information
-
-    #Lineups Information
-
-    #Power Rankings Information
-
-    #Transactions Information
-    players = requests.get(url+'nfl/players')
-    players = players.json()
-
-    #Divisions Information
-
-    #Champions Information
-
-    #Eras Information
-
-    #Records Information
+# --- TAB 3: Rookie Drafts ---
+with tab_draft:
+    draft_df = load_draft_picks()
+    if not draft_df.empty:
+        draft_years = sorted(draft_df["year"].unique(), reverse=True)
+        selected_draft_year = st.selectbox("Select Draft Season", draft_years, key="draft_year")
+        
+        filtered_draft = draft_df[draft_df["year"] == selected_draft_year]
+        st.dataframe(
+            filtered_draft[[
+                "round", "pick_no", "drafted_by", "player_name", "position", "nfl_team"
+            ]].rename(columns={
+                "round": "Round",
+                "pick_no": "Pick",
+                "drafted_by": "Manager",
+                "player_name": "Player",
+                "position": "Pos",
+                "nfl_team": "NFL Team"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No draft records found in the database.")
