@@ -1,132 +1,255 @@
 import sqlite3
-from espn_api.football import League
+import requests
+from typing import Dict, List, Any, Set
 
 DB_PATH = r"C:\Users\wilgu\Desktop\Fun\a-dynasty-league\dynasty_data.db"
-LEAGUE_ID = 2255318  # Replace with your ESPN League ID (integer)
+LEAGUE_ID = 2255318
 SWID = "{E9847B8A-5D66-44EE-BC5F-D7E4A554CDC7}"
 ESPN_S2 = r"AEAbITOsDs5gtiiTG4JvTzEvrh5n%2F7owp0n7ZJgl7IpQXs2zHJM6TZAJLyoymtnRmak6jmkoWhJ8NEcnUl7ZPerjOXk%2BLgLhfzw8VsXye9wOupr7iXxIlxTCaAsY%2Fr1Fl%2BlTxVbt8fhIgWTox45PXXPUK0zmlFZ1XbFpd9fBH%2BZrbOFlEOHQzp8X1BhPwgpmXi%2Fveog8dlSPxyVtfVxwN9Mic%2BrwY%2B81XJIgr4g65FtXsOap8Zot9Ychkx6IrM4HPMH4eHbR1xfHV8BNS%2FHeImJt"
 
 
-def populate_espn_season(year: int):
-    print(f"\n--- Processing ESPN Season {year} ---")
-    
-    # Initialize connection to ESPN API
+# ESPN Slot ID -> Lineup Slot Name
+SLOT_MAP = {
+    0: "QB",
+    2: "RB",
+    4: "WR",
+    6: "TE",
+    16: "DEF",
+    17: "K",
+    20: "BN",
+    21: "IR",
+    23: "FLEX",
+}
+
+# ESPN Default Position ID -> Position Abbreviation
+POSITION_MAP = {
+    1: "QB",
+    2: "RB",
+    3: "WR",
+    4: "TE",
+    5: "K",
+    16: "DEF",
+}
+
+
+def fetch_espn_data(params: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/leagueHistory/{LEAGUE_ID}"
+    cookies = {"espn_s2": ESPN_S2, "SWID": SWID}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    response = requests.get(url, params=params, cookies=cookies, headers=headers)
+    response.raise_for_status()
+    payload = response.json()
+    return payload[0] if isinstance(payload, list) else payload
+
+
+def get_espn_championship_path(schedule: List[Dict[str, Any]], max_week: int) -> Set[tuple]:
+    """
+    Traces backward from the final championship week to isolate strictly
+    matchups leading to the title, omitting consolation brackets.
+    """
+    final_week_games = [
+        m for m in schedule
+        if m.get("matchupPeriodId") == max_week and m.get("away") and m.get("home")
+    ]
+    if not final_week_games:
+        return set()
+
+    champ_game = final_week_games[0]
+    champ_teams = {champ_game["home"]["teamId"], champ_game["away"]["teamId"]}
+    valid_playoff_teams = {(max_week, t_id) for t_id in champ_teams}
+
+    for week in range(max_week - 1, max_week - 3, -1):
+        for m in schedule:
+            if m.get("matchupPeriodId") == week and m.get("away") and m.get("home"):
+                h_id = m["home"]["teamId"]
+                a_id = m["away"]["teamId"]
+                if any((week + 1, t_id) in valid_playoff_teams for t_id in [h_id, a_id]):
+                    valid_playoff_teams.add((week, h_id))
+                    valid_playoff_teams.add((week, a_id))
+
+    return valid_playoff_teams
+
+
+def populate_espn_season(year: int, db_path: str = DB_PATH):
+    print(f"\n[1/4] Fetching base {year} season data (teams, schedule, divisions)...")
     try:
-        league = League(
-            league_id=LEAGUE_ID,
-            year=year,
-            espn_s2=ESPN_S2,
-            swid=SWID
-        )
+        base_params = {
+            "seasonId": year,
+            "view": ["mTeam", "mRoster", "mMatchup", "mSettings"]
+        }
+        season = fetch_espn_data(base_params)
     except Exception as e:
-        print(f"Failed to connect to ESPN for {year}: {e}")
+        print(f"Failed to fetch base season data: {e}")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    members_map = {
+        m["id"]: m.get("displayName", f"User_{m['id']}")
+        for m in season.get("members", [])
+    }
+    divisions_info = season.get("settings", {}).get("scheduleSettings", {}).get("divisions", [])
+    div_names = {d["id"]: d["name"] for d in divisions_info}
+
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
     try:
-        # 1. Teams & Standings
-        print("Extracting teams and season standings...")
+        # 1. Teams, Standings & Divisions
+        print("[2/4] Inserting Teams, Standings, and Divisions...")
         teams_to_insert = []
+        divisions_to_insert = []
         standings_to_insert = []
 
-        for team in league.teams:
-            team_id = team.team_id
-            owner_name = team.owner.strip() if hasattr(team, 'owner') and team.owner else f"Owner_{team_id}"
-            team_name = team.team_name.strip()
-            
-            teams_to_insert.append((year, team_id, owner_name, team_name))
-            
-            # Standings metrics
-            wins = getattr(team, 'wins', 0)
-            losses = getattr(team, 'losses', 0)
-            ties = getattr(team, 'ties', 0)
-            points_for = round(float(getattr(team, 'points_for', 0.0)), 2)
-            points_against = round(float(getattr(team, 'points_against', 0.0)), 2)
-            # ESPN does not natively track Max PF in legacy APIs; use points_for as fallback
+        for t in season.get("teams", []):
+            t_id = t["id"]
+            team_name = t.get("name", f"Team {t_id}")
+            primary_owner = t.get("primaryOwner") or (t.get("owners") or [""])[0]
+            owner_name = members_map.get(primary_owner, f"Owner_{t_id}")
+
+            teams_to_insert.append((year, t_id, owner_name, team_name))
+
+            div_id = t.get("divisionId")
+            if div_id is not None:
+                divisions_to_insert.append((
+                    year,
+                    div_id,
+                    div_names.get(div_id, f"Division {div_id}"),
+                    t_id,
+                ))
+
+            overall = t.get("record", {}).get("overall", {})
+            wins = overall.get("wins", 0)
+            losses = overall.get("losses", 0)
+            ties = overall.get("ties", 0)
+            points_for = round(float(overall.get("pointsFor", 0.0)), 2)
+            points_against = round(float(overall.get("pointsAgainst", 0.0)), 2)
             max_pf = points_for
 
             standings_to_insert.append((
-                year, team_id, wins, losses, ties, points_for, points_against, max_pf
+                year, t_id, wins, losses, ties, points_for, points_against, max_pf
             ))
 
         cur.executemany(
             "INSERT OR REPLACE INTO teams (year, team_id, owner, team_name) VALUES (?, ?, ?, ?)",
-            teams_to_insert
+            teams_to_insert,
         )
         cur.executemany(
             """INSERT OR REPLACE INTO standings (
                 year, team_id, wins, losses, ties, points_for, points_against, max_pf
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            standings_to_insert
+            standings_to_insert,
         )
-        print(f" -> Stored {len(teams_to_insert)} teams and standings.")
+        if divisions_to_insert:
+            cur.executemany(
+                "INSERT OR REPLACE INTO divisions (year, division_id, division_name, team_id) VALUES (?, ?, ?, ?)",
+                divisions_to_insert,
+            )
 
-        # 2. Matchups and Lineups
-        print("Extracting weekly box scores and lineups...")
+        print(f" -> Stored {len(teams_to_insert)} teams, {len(divisions_to_insert)} division mappings, and {len(standings_to_insert)} standings.")
+
+        # 2. Matchups and Weekly Boxscore Lineups
+        print("[3/4] Scraping weekly box scores and player lineups (Weeks 1 to 16)...")
+        schedule = season.get("schedule", [])
+        max_week = max((m.get("matchupPeriodId", 0) for m in schedule), default=16)
+        playoff_start = season.get("settings", {}).get("scheduleSettings", {}).get("matchupPeriodCount", 13) + 1
+        champ_path_teams = get_espn_championship_path(schedule, max_week)
+
         games_to_insert = []
         lineups_to_insert = []
 
-        # ESPN regular + playoff weeks for 2017/2018 typically ran weeks 1 to 16 or 17
-        total_weeks = getattr(league.settings, 'playoff_team_count', 16)
-        playoff_start = getattr(league.settings, 'playoff_start_week', 14)
-
-        for week in range(1, 18):
+        for week in range(1, max_week + 1):
+            print(f"   Fetching Week {week} boxscores...")
+            week_params = {
+                "seasonId": year,
+                "view": ["mBoxscore", "mMatchup"],
+                "scoringPeriodId": week
+            }
             try:
-                box_scores = league.box_scores(week=week)
-            except Exception:
-                # Weeks beyond season end return exceptions or empty sets
-                break
-
-            if not box_scores:
+                week_data = fetch_espn_data(week_params)
+            except Exception as e:
+                print(f"   Warning: Could not fetch boxscores for week {week}: {e}")
                 continue
 
-            for m_idx, matchup in enumerate(box_scores, start=1):
-                game_id = int(f"{year}{week:02d}{m_idx:02d}")
+            week_schedule = [
+                m for m in week_data.get("schedule", [])
+                if m.get("matchupPeriodId") == week
+            ]
+
+            for m in week_schedule:
                 is_playoff = week >= playoff_start
+                m_id = m.get("id", 0)
+                game_id = int(f"{year}{week:02d}{m_id:02d}")
 
-                home_team = matchup.home_team
-                away_team = matchup.away_team
+                home = m.get("home")
+                away = m.get("away")
 
-                # Handle Bye weeks
-                if not away_team and home_team:
-                    paired = [(home_team, None, matchup.home_score, 0.0, matchup.home_lineup)]
-                elif not home_team and away_team:
-                    paired = [(away_team, None, matchup.away_score, 0.0, matchup.away_lineup)]
-                else:
-                    paired = [
-                        (home_team, away_team, matchup.home_score, matchup.away_score, matchup.home_lineup),
-                        (away_team, home_team, matchup.away_score, matchup.home_score, matchup.away_lineup)
+                pairs = []
+                if home and away:
+                    h_id = home["teamId"]
+                    a_id = away["teamId"]
+
+                    # Filter out consolation bracket playoff games
+                    if is_playoff and not (
+                        (week, h_id) in champ_path_teams and (week, a_id) in champ_path_teams
+                    ):
+                        continue
+
+                    h_pts = round(float(home.get("totalPoints", 0.0)), 2)
+                    a_pts = round(float(away.get("totalPoints", 0.0)), 2)
+
+                    pairs = [
+                        (home, h_id, a_id, h_pts, a_pts),
+                        (away, a_id, h_id, a_pts, h_pts),
                     ]
+                elif home:
+                    h_id = home["teamId"]
+                    if is_playoff and (week, h_id) not in champ_path_teams:
+                        continue
+                    h_pts = round(float(home.get("totalPoints", 0.0)), 2)
+                    pairs = [(home, h_id, None, h_pts, 0.0)]
 
-                for current_team, opp_team, team_score, opp_score, roster in paired:
-                    t_id = current_team.team_id
-                    opp_id = opp_team.team_id if opp_team else None
-                    team_pts = round(float(team_score), 2)
-                    opp_pts = round(float(opp_score), 2)
-
-                    is_win = team_pts > opp_pts if opp_team else True
-                    is_loss = team_pts < opp_pts if opp_team else False
-                    is_tie = team_pts == opp_pts if opp_team else False
+                for side_obj, t_id, opp_id, score, opp_score in pairs:
+                    is_win = score > opp_score if opp_id else True
+                    is_loss = score < opp_score if opp_id else False
+                    is_tie = score == opp_score if opp_id else False
 
                     games_to_insert.append((
-                        year, week, game_id, t_id, opp_id,
-                        team_pts, 0.0, is_playoff, is_win, is_tie, is_loss
+                        year,
+                        week,
+                        game_id,
+                        t_id,
+                        opp_id,
+                        score,
+                        0.0,
+                        is_playoff,
+                        is_win,
+                        is_tie,
+                        is_loss,
                     ))
 
-                    # Parse player lineups
-                    for player in roster:
-                        p_id = getattr(player, 'playerId', None)
-                        p_name = getattr(player, 'name', 'Unknown')
-                        pos = getattr(player, 'position', 'Unknown')
-                        slot_pos = getattr(player, 'slot_position', 'BN')
-                        p_score = round(float(getattr(player, 'points', 0.0)), 2)
-                        p_proj = round(float(getattr(player, 'projected_points', 0.0)), 2)
+                    roster = side_obj.get("rosterForMatchupPeriod", {}).get("entries", [])
+                    for entry in roster:
+                        p_pool = entry.get("playerPoolEntry", {})
+                        player = p_pool.get("player", {})
+                        p_id = player.get("id")
+                        p_name = player.get("fullName", "Unknown")
+                        pos = POSITION_MAP.get(player.get("defaultPositionId"), "Unknown")
+                        slot_pos = SLOT_MAP.get(entry.get("lineupSlotId"), "BN")
+                        status = player.get("injuryStatus", "ACTIVE")
+                        p_score = round(float(p_pool.get("appliedStatTotal", 0.0)), 2)
 
                         lineups_to_insert.append((
-                            year, week, game_id, t_id, p_id, p_name,
-                            pos, slot_pos, "Active", p_score, p_proj
+                            year,
+                            week,
+                            game_id,
+                            t_id,
+                            p_id,
+                            p_name,
+                            pos,
+                            slot_pos,
+                            status,
+                            p_score,
+                            0.0,
                         ))
 
         cur.executemany(
@@ -134,7 +257,7 @@ def populate_espn_season(year: int):
                 year, week, game_id, team_id, opponent_team_id,
                 team_score, team_proj_score, is_playoff, is_win, is_tie, is_loss
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            games_to_insert
+            games_to_insert,
         )
 
         cur.executemany(
@@ -143,56 +266,27 @@ def populate_espn_season(year: int):
                 player_position, player_slot_position, player_status,
                 player_score, player_proj_score
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            lineups_to_insert
+            lineups_to_insert,
         )
+
         print(f" -> Stored {len(games_to_insert)} games and {len(lineups_to_insert)} lineup rows.")
 
-        # 3. Draft Picks
-        print("Extracting draft history...")
-        draft_picks_to_insert = []
-        if hasattr(league, 'draft') and league.draft:
-            for pick in league.draft:
-                round_num = pick.round_num
-                round_pick_no = pick.round_pick
-                team_id = pick.team.team_id if hasattr(pick, 'team') and pick.team else 0
-                player_id = getattr(pick, 'playerId', None)
-                player_name = getattr(pick, 'playerName', 'Unknown')
-                
-                draft_picks_to_insert.append((
-                    int(f"{year}01"),  # synthetic draft_id
-                    year,
-                    round_num,
-                    round_pick_no,
-                    team_id,
-                    player_id,
-                    player_name,
-                    "Unknown",
-                    "FA",
-                    getattr(pick.team, 'owner', f"Team_{team_id}"),
-                    getattr(pick.team, 'owner', f"Team_{team_id}")
-                ))
-
-            cur.executemany(
-                """INSERT OR REPLACE INTO draft_picks (
-                    draft_id, year, round, pick_no, team_id,
-                    player_id, player_name, position, nfl_team,
-                    original_roster, previous_owner
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                draft_picks_to_insert
-            )
-            print(f" -> Stored {len(draft_picks_to_insert)} draft picks.")
-
+        # 3. Commit
+        print("[4/4] Committing changes to SQLite database...")
         conn.commit()
-        print(f"✓ Season {year} inserted successfully.")
+        print(f"✓ Season {year} successfully imported.")
 
     except Exception as e:
         conn.rollback()
-        print(f"Error processing season {year}: {e}")
+        print(f"Error during import: {e}")
         raise
     finally:
         conn.close()
 
 
 if __name__ == "__main__":
-    for yr in [2017, 2018]:
-        populate_espn_season(yr)
+    year_input = input("Enter ESPN League Year (e.g., 2017, 2018): ").strip()
+    if year_input.isdigit():
+        populate_espn_season(int(year_input))
+    else:
+        print("Invalid year provided. Exiting.")
