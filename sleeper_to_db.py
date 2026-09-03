@@ -368,13 +368,17 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
                 continue
 
             raw_draft_id = draft.get("draft_id")
+            if raw_draft_id == '1082380613652430848':
+                continue
+
             draft_id_val = int("".join(filter(str.isdigit, str(raw_draft_id))) or 0)
             draft_year = int(draft.get("season", year))
+
             picks = fetch_json(f"{SLEEPER_BASE_URL}/draft/{raw_draft_id}/picks")
 
             for pick in picks:
                 round_num = pick.get("round")
-                pick_no = pick.get("pick_no")
+                pick_no = pick.get("draft_slot") or pick.get("pick_no")
                 team_id = pick.get("roster_id")
                 pid = pick.get("player_id")
 
