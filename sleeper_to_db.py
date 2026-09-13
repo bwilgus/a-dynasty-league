@@ -277,7 +277,7 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
                         try:
                             p_id_int = int(pid)
                         except ValueError:
-                            p_id_int = None
+                            p_id_int = pid  # non-numeric ids (e.g. "SEA" for a D/ST) are valid Sleeper ids too
 
                         lineups_to_insert.append((year, week, current_game_id, team_id, p_id_int, p_name, pos, slot_pos, status, p_score, 0.0))
 
@@ -421,7 +421,7 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
                 try:
                     player_id = int(pid) if pid else None
                 except ValueError:
-                    player_id = None
+                    player_id = pid  # non-numeric ids (e.g. "SEA" for a D/ST) are valid Sleeper ids too
 
                 meta = pick.get("metadata", {})
                 first_name = meta.get("first_name", "")
