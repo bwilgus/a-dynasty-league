@@ -1,0 +1,2 @@
+- Recover 2017 and 2018 data via espn_scraper_2017_2018 and transaction_test along with Gemini convo
+- streamlit
