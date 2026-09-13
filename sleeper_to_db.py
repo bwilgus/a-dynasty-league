@@ -141,10 +141,10 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
     cur = conn.cursor()
 
     try:
-        # 1. Teams & Standings
+        # 1. Teams & Divisions
+        # (standings is a derived table now -- see build_standings.py -- not written here)
         teams_to_insert = []
         divisions_to_insert = []
-        standings_to_insert = []
 
         for r in rosters:
             team_id = r["roster_id"]
@@ -166,27 +166,14 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
                 )
                 divisions_to_insert.append((year, division_id, div_name, team_id))
 
-            st = r.get("settings", {})
-            wins = st.get("wins", 0)
-            losses = st.get("losses", 0)
-            ties = st.get("ties", 0)
-            points_for = round(st.get("fpts", 0) + (st.get("fpts_decimal", 0) / 100.0), 2)
-            points_against = round(st.get("fpts_against", 0) + (st.get("fpts_against_decimal", 0) / 100.0), 2)
-            max_pf = round(st.get("ppts", 0) + (st.get("ppts_decimal", 0) / 100.0), 2)
-            standings_to_insert.append((year, team_id, wins, losses, ties, points_for, points_against, max_pf))
-
         cur.executemany("INSERT OR REPLACE INTO teams (year, team_id, owner, team_name) VALUES (?, ?, ?, ?)", teams_to_insert)
-        cur.executemany(
-            "INSERT OR REPLACE INTO standings (year, team_id, wins, losses, ties, points_for, points_against, max_pf) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            standings_to_insert,
-        )
         if divisions_to_insert:
             cur.executemany(
                 "INSERT OR REPLACE INTO divisions (year, division_id, division_name, team_id) VALUES (?, ?, ?, ?)",
                 divisions_to_insert,
             )
 
-        print(f" -> Stored {len(teams_to_insert)} teams, {len(standings_to_insert)} standings records.")
+        print(f" -> Stored {len(teams_to_insert)} teams.")
 
         # 2. Matchups, Lineups & Efficiency
         print("[3/6] Scraping weekly matchups, starting lineups, and manager efficiency...")
@@ -329,6 +316,7 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
         # 3. Transactions
         print("[4/6] Scraping transactions...")
         transactions_to_insert = []
+        pick_transactions_to_insert = []
         for week in range(1, 19):
             trans_url = f"{SLEEPER_BASE_URL}/league/{league_id}/transactions/{week}"
             weekly_trans = fetch_json(trans_url)
@@ -352,11 +340,49 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
                     p_name = f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip() or str(pid)
                     transactions_to_insert.append((trans_id, roster_id, year, week, trans_type, "drop", p_name))
 
+                for pick in (t.get("draft_picks") or []):
+                    pick_transactions_to_insert.append((
+                        trans_id,
+                        year,
+                        week,
+                        int(pick.get("season")),
+                        pick.get("round"),
+                        pick.get("roster_id"),
+                        pick.get("previous_owner_id"),
+                        pick.get("owner_id"),
+                    ))
+
         cur.executemany(
             "INSERT OR REPLACE INTO transactions (trans_id, team_id, year, week, trans_type, action, player) VALUES (?, ?, ?, ?, ?, ?, ?)",
             transactions_to_insert,
         )
         print(f" -> Stored {len(transactions_to_insert)} transactions.")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pick_transactions (
+                trans_id TEXT NOT NULL,
+                trade_year INTEGER NOT NULL,
+                trade_week INTEGER NOT NULL,
+                pick_season INTEGER NOT NULL,
+                pick_round INTEGER NOT NULL,
+                original_team_id INTEGER NOT NULL,
+                from_team_id INTEGER NOT NULL,
+                to_team_id INTEGER NOT NULL,
+                PRIMARY KEY (trans_id, pick_season, pick_round, original_team_id)
+            )
+            """
+        )
+        cur.executemany(
+            """
+            INSERT OR REPLACE INTO pick_transactions (
+                trans_id, trade_year, trade_week, pick_season, pick_round,
+                original_team_id, from_team_id, to_team_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            pick_transactions_to_insert,
+        )
+        print(f" -> Stored {len(pick_transactions_to_insert)} pick trade records.")
 
         # 4. Draft Picks
         print("[5/6] Scraping draft history...")
