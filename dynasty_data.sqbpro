@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?><sqlb_project><db path="dynasty_data.db" readonly="0" foreign_keys="1" case_sensitive_like="0" temp_store="0" wal_autocheckpoint="1000" synchronous="2"/><attached/><window><main_tabs open="structure browser pragmas query" current="3"/></window><tab_structure><column_width id="0" width="300"/><column_width id="1" width="0"/><column_width id="2" width="100"/><column_width id="3" width="4726"/><column_width id="4" width="0"/><expanded_item id="0" parent="1"/><expanded_item id="1" parent="1"/><expanded_item id="2" parent="1"/><expanded_item id="3" parent="1"/></tab_structure><tab_browse><table title="transactions" custom_title="0" dock_id="1" table="4,12:maintransactions"/><table title="divisions" custom_title="0" dock_id="2" table="4,9:maindivisions"/><dock_state state="000000ff00000000fd0000000100000002000005bb00000390fc0100000001fc00000000000005bb0000013300fffffffa000000010100000002fb000000160064006f0063006b00420072006f00770073006500310100000000ffffffff0000013300fffffffb000000160064006f0063006b00420072006f00770073006500320100000000ffffffff0000012900ffffff000002690000000000000004000000040000000800000008fc00000000"/><default_encoding codec=""/><browse_table_settings><table schema="main" name="df_final" show_row_id="0" encoding="" plot_x_axis="" unlock_view_pk="_rowid_" freeze_columns="0"><sort/><column_widths><column index="1" value="46"/><column index="2" value="119"/><column index="3" value="143"/><column index="4" value="63"/><column index="5" value="127"/><column index="6" value="127"/><column index="7" value="55"/><column index="8" value="72"/><column index="9" value="63"/><column index="10" value="132"/><column index="11" value="47"/><column index="12" value="83"/><column index="13" value="55"/><column index="14" value="119"/><column index="15" value="35"/><column index="16" value="40"/><column index="17" value="39"/><column index="18" value="96"/><column index="19" value="72"/><column index="20" value="53"/><column index="21" value="70"/><column index="22" value="46"/><column index="23" value="115"/><column index="24" value="53"/><column index="25" value="89"/><column index="26" value="147"/><column index="27" value="65"/><column index="28" value="64"/><column index="29" value="101"/><column index="30" value="55"/><column index="31" value="55"/><column index="32" value="87"/><column index="33" value="92"/><column index="34" value="96"/><column index="35" value="35"/><column index="36" value="47"/><column index="37" value="39"/><column index="38" value="45"/><column index="39" value="35"/></column_widths><filter_values/><conditional_formats/><row_id_formats/><display_formats/><hidden_columns/><plot_y_axes/><global_filter/></table><table schema="main" name="divisions" show_row_id="0" encoding="" plot_x_axis="" unlock_view_pk="_rowid_" freeze_columns="0"><sort><column index="0" mode="1"/></sort><column_widths><column index="1" value="39"/><column index="2" value="68"/><column index="3" value="119"/><column index="4" value="55"/></column_widths><filter_values/><conditional_formats/><row_id_formats/><display_formats/><hidden_columns/><plot_y_axes/><global_filter/></table><table schema="main" name="games" show_row_id="0" encoding="" plot_x_axis="" unlock_view_pk="_rowid_" freeze_columns="0"><sort><column index="0" mode="1"/></sort><column_widths><column index="1" value="39"/><column index="2" value="38"/><column index="3" value="57"/><column index="4" value="55"/><column index="5" value="116"/><column index="6" value="76"/><column index="7" value="106"/><column index="8" value="63"/><column index="9" value="43"/><column index="10" value="39"/><column index="11" value="46"/></column_widths><filter_values/><conditional_formats/><row_id_formats/><display_formats/><hidden_columns/><plot_y_axes/><global_filter/></table><table schema="main" name="lineups" show_row_id="0" encoding="" plot_x_axis="" unlock_view_pk="_rowid_" freeze_columns="0"><sort><column index="0" mode="1"/></sort><column_widths><column index="1" value="39"/><column index="2" value="38"/><column index="3" value="57"/><column index="4" value="55"/><column index="5" value="63"/><column index="6" value="199"/><column index="7" value="96"/><column index="8" value="124"/><column index="9" value="87"/><column index="10" value="82"/><column index="11" value="112"/></column_widths><filter_values/><conditional_formats/><row_id_formats/><display_formats/><hidden_columns/><plot_y_axes/><global_filter/></table><table schema="main" name="teams" show_row_id="0" encoding="" plot_x_axis="" unlock_view_pk="_rowid_" freeze_columns="0"><sort><column index="0" mode="1"/></sort><column_widths><column index="1" value="39"/><column index="2" value="55"/><column index="3" value="127"/><column index="4" value="207"/></column_widths><filter_values/><conditional_formats/><row_id_formats/><display_formats/><hidden_columns/><plot_y_axes/><global_filter/></table><table schema="main" name="transactions" show_row_id="0" encoding="" plot_x_axis="" unlock_view_pk="_rowid_" freeze_columns="0"><sort><column index="2" mode="1"/></sort><column_widths><column index="1" value="188"/><column index="2" value="55"/><column index="3" value="39"/><column index="4" value="38"/><column index="5" value="79"/><column index="6" value="43"/><column index="7" value="191"/></column_widths><filter_values/><conditional_formats/><row_id_formats/><display_formats/><hidden_columns/><plot_y_axes/><global_filter/></table></browse_table_settings></tab_browse><tab_sql><sql name="SQL 1*">select l.year, l.week, l.player_name, l.player_position, l.player_slot_position, t.owner
+from lineups as l
+left join teams as t
+	on l.year = t.year
+	and l.team_id = t.team_id
+where l.year = 2024
+and t.owner = 'bwilgus'
+and l.week = 1
+order by player_slot_position</sql><sql name="SQL 2*">delete from games where year &gt; 2023;
+delete from divisions where year &gt; 2023;
+delete from teams where year &gt; 2023;
+delete from transactions where year &gt; 2023;
+delete from lineups where year &gt; 2023;
+delete from draft_picks where year &gt; 2023;
+delete from standings where year &gt; 2023;</sql><sql name="SQL 3*">select *
+from games
+where year = 2025
+
+;
+
+select *
+from lineups
+where year = 2025
+and week = 17</sql><sql name="SQL 6*">select * from draft_picks order by year desc</sql><sql name="SQL 7*">select year, round, pick_no, count(1) as ct
+from draft_picks
+group by year, round, pick_no
+having ct &gt; 1
+
+;
+
+select *
+from draft_picks
+where year = 2024
+and round = 1
+and pick_no = 3
+
+;
+
+select trans_id, player, count(1)
+from transactions
+where year = 2025
+group by trans_id, player
+having count(1) &gt; 1
+
+;
+
+select *
+from transactions
+where trans_id = 1084931824025006080
+
+;
+
+select *
+from draft_picks
+--where draft_id = 1082380613652430848
+order by year desc
+
+;
+
+UPDATE draft_picks
+SET pick_no = ((pick_no - 1) % 12) + 1
+WHERE year IN (2024, 2025);</sql><sql name="SQL 8*">select *
+from owners
+
+;
+
+select owner, count(distinct team_id) as ct
+from teams
+group by owner
+having ct &gt; 1
+
+;
+
+select team_id, count(distinct owner) as ct
+from teams
+group by team_id
+having ct &gt; 1
+
+;
+
+select *
+from teams
+where team_id = 2
+
+;
+
+;
+--user_id, username, real_name, first_name, last_name
+insert into owners
+select distinct null, owner, null, null, null
+from teams
+where year &lt; 2024
+order by owner
+</sql><sql name="SQL 9*">with position_ranks as (
+	select l.year, l.week, l.game_id, l.team_id, l.player_id, l.player_name, l.player_position, l.player_score, rank() over (partition by l.year, l.week, l.game_id, l.team_id, l.player_position order by l.player_score desc, l.player_id asc) as position_rank
+	from lineups as l
+	left join games as g
+		on l.year = g.year
+		and l.week = g.week
+		and l.game_id = g.game_id
+		and l.team_id = g.team_id
+	where g.is_playoff = 0
+)
+
+,flex_ranks as (
+	select year, week, game_id, team_id, player_id, player_name, 'FLEX' as player_position, player_score, rank() over (partition by year, week, game_id, team_id order by player_score desc, player_id asc) as position_rank 
+	from position_ranks
+	where (player_position in ('RB','WR') and position_rank &gt; 2)
+		or (player_position = 'TE' and position_rank &gt; 1)
+)
+
+,ranks as (
+	select *
+	from position_ranks
+	where (player_position = 'QB' and position_rank = 1)
+	or (player_position = 'RB' and position_rank &lt; 3)
+	or (player_position = 'WR' and position_rank &lt; 3)
+	or (player_position = 'TE' and position_rank &lt; 2)
+	or (player_position = 'K' and position_rank &lt; 2)
+	or (player_position = 'D/ST' and position_rank &lt; 2)
+
+	UNION
+
+
+	select * 
+	from flex_ranks
+	where position_rank &lt; 3
+)
+
+,max_points as (
+	select year, team_id, sum(player_score) as max_pf
+	from ranks
+	group by year, team_id
+)
+
+--year, team_id, wins, losses, ties, points_for, points_against, max_pf
+select g.year, g.team_id, sum(g.is_win) as wins, sum(g.is_loss) as losses, sum(g.is_tie) as ties, sum(g.team_score) as team_score, sum(og.opp_team_score) as points_against, mp.max_pf
+from games as g
+left join (
+	select year, week, game_id, team_id as opponent_team_id, team_score as opp_team_score
+	from games
+) as og
+	on g.year = og.year
+	and g.week = og.week
+	and g.opponent_team_id = og.opponent_team_id
+left join max_points as mp
+	on g.year = mp.year
+	and g.team_id = mp.team_id
+where g.is_playoff = 0
+group by g.year, g.team_id, mp.max_pf</sql><sql name="SQL 10*">with position_ranks as (
+	select year, week, game_id, team_id, player_id, player_name, player_position, player_score, rank() over (partition by year, week, game_id, team_id, player_position order by player_score desc, player_id asc) as position_rank
+	from lineups
+)
+
+,flex_ranks as (
+	select year, week, game_id, team_id, player_id, player_name, 'FLEX' as player_position, player_score, rank() over (partition by year, week, game_id, team_id order by player_score desc, player_id asc) as position_rank 
+	from position_ranks
+	where (player_position in ('RB','WR') and position_rank &gt; 2)
+		or (player_position = 'TE' and position_rank &gt; 1)
+)
+
+,ranks as (
+	select *
+	from position_ranks
+	where (player_position = 'QB' and position_rank = 1)
+	or (player_position = 'RB' and position_rank &lt; 3)
+	or (player_position = 'WR' and position_rank &lt; 3)
+	or (player_position = 'TE' and position_rank &lt; 2)
+	or (player_position = 'K' and position_rank &lt; 2)
+	or (player_position = 'D/ST' and position_rank &lt; 2)
+
+	UNION
+
+
+	select * 
+	from flex_ranks
+	where position_rank &lt; 3
+)
+
+;
+
+select *
+from games
+where year = 2018</sql><sql name="SQL 13*">select *
+from draft_picks
+where year = 2018
+
+</sql><current_tab id="5"/></tab_sql></sqlb_project>

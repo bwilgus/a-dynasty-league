@@ -376,6 +376,16 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
 
             picks = fetch_json(f"{SLEEPER_BASE_URL}/draft/{raw_draft_id}/picks")
 
+            traded_picks = fetch_json(f"{SLEEPER_BASE_URL}/draft/{raw_draft_id}/traded_picks") or []
+            trade_map = {}
+            for tp in traded_picks:
+                r_id = tp.get("roster_id")
+                rnd = tp.get("round")
+                trade_map.setdefault((r_id, rnd), []).append({
+                    "orig": tp.get("original_owner_id"),
+                    "prev": tp.get("previous_owner_id")
+                })
+
             for pick in picks:
                 round_num = pick.get("round")
                 pick_no = pick.get("draft_slot") or pick.get("pick_no")
@@ -399,10 +409,18 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
                 position = meta.get("position") or all_players.get(str(pid), {}).get("position", "Unknown")
                 nfl_team = meta.get("team") or all_players.get(str(pid), {}).get("team", "FA")
 
-                orig_roster_id = pick.get("original_roster_id") or team_id
-                prev_roster_id = pick.get("previous_roster_id") or orig_roster_id
+                orig_roster_id = team_id
+                prev_roster_id = team_id
+
+                # If this team acquired a pick in this round via trade, consume one record
+                if (team_id, round_num) in trade_map and trade_map[(team_id, round_num)]:
+                    trade_info = trade_map[(team_id, round_num)].pop(0)
+                    orig_roster_id = trade_info["orig"] or team_id
+                    prev_roster_id = trade_info["prev"] or orig_roster_id
+
                 original_roster = roster_owner_map.get(orig_roster_id, str(orig_roster_id))
                 previous_owner = roster_owner_map.get(prev_roster_id, str(prev_roster_id))
+                # ----------------------------------------------------
 
                 draft_picks_to_insert.append(
                     (
