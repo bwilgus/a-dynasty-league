@@ -1,5 +1,6 @@
 import sqlite3
 import requests
+import pandas as pd
 from typing import Dict, Any, List, Set
 
 SLEEPER_BASE_URL = "https://api.sleeper.app/v1"
@@ -12,6 +13,28 @@ FLEX_ELIGIBILITY = {
     "WRRB_FLEX": {"RB", "WR"},
     "IDP_FLEX": {"DL", "LB", "DB"},
 }
+
+TEAMS_COLUMNS = ["year", "team_id", "owner", "team_name"]
+DIVISIONS_COLUMNS = ["year", "division_id", "division_name", "team_id"]
+GAMES_COLUMNS = [
+    "year", "week", "game_id", "team_id", "opponent_team_id",
+    "team_score", "team_proj_score", "is_playoff", "is_win", "is_tie", "is_loss",
+]
+LINEUPS_COLUMNS = [
+    "year", "week", "game_id", "team_id", "player_id", "player_name",
+    "player_position", "player_slot_position", "player_status",
+    "player_score", "player_proj_score",
+]
+MANAGER_EFFICIENCY_COLUMNS = ["year", "week", "team_id", "actual_score", "optimal_score", "efficiency_pct"]
+TRANSACTIONS_COLUMNS = ["trans_id", "team_id", "year", "week", "trans_type", "action", "player"]
+PICK_TRANSACTIONS_COLUMNS = [
+    "trans_id", "trade_year", "trade_week", "pick_season", "pick_round",
+    "original_team_id", "from_team_id", "to_team_id",
+]
+DRAFT_PICKS_COLUMNS = [
+    "draft_id", "year", "round", "pick_no", "team_id", "player_id",
+    "player_name", "position", "nfl_team", "original_roster", "previous_owner",
+]
 
 
 def fetch_json(url: str) -> Any:
@@ -111,13 +134,19 @@ def get_championship_path_rosters(league_id: str, playoff_week_start: int) -> Se
     return valid_playoff_teams
 
 
-def populate_league_data(league_id: str, db_path: str = DB_PATH):
+def _fetch_raw_league_data(league_id: str) -> Dict[str, Any]:
+    """Fetches one Sleeper season's full data set from the API.
+
+    Returns plain lists of row-tuples, one list per dynasty_data.db table,
+    shaped identically to that table's INSERT statement -- plus the season's
+    `year` and raw `league_info`. This is the single source of truth for how
+    a Sleeper season becomes dynasty_data.db rows: populate_league_data()
+    writes these tuples to SQLite, and fetch_league_dataframes() wraps them
+    as DataFrames for live (non-persisted) reads -- so the two can't drift
+    apart from each other.
+    """
     print(f"\n[1/6] Fetching league metadata for League ID: {league_id}...")
-    try:
-        league_info = fetch_json(f"{SLEEPER_BASE_URL}/league/{league_id}")
-    except requests.exceptions.HTTPError as e:
-        print(f"Error fetching league: {e}. Please check that the League ID is valid.")
-        return
+    league_info = fetch_json(f"{SLEEPER_BASE_URL}/league/{league_id}")
 
     year = int(league_info.get("season", 0))
     settings = league_info.get("settings", {})
@@ -137,149 +166,319 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
     }
     player_pos_map = {pid: info.get("position", "Unknown") for pid, info in all_players.items()}
 
+    # 1. Teams & Divisions
+    # (standings is a derived table now -- see build_standings.py -- not written here)
+    teams_to_insert = []
+    divisions_to_insert = []
+
+    for r in rosters:
+        team_id = r["roster_id"]
+        owner_id = r.get("owner_id")
+        user = user_map.get(owner_id, {})
+
+        owner_name = user.get("display_name", f"Owner_{team_id}")
+        team_name = (
+            (r.get("metadata") or {}).get("team_name")
+            or (user.get("metadata") or {}).get("team_name")
+            or f"{owner_name}'s Team"
+        )
+        teams_to_insert.append((year, team_id, owner_name, team_name))
+
+        division_id = r.get("settings", {}).get("division")
+        if division_id is not None:
+            div_name = (league_info.get("metadata") or {}).get(
+                f"division_{division_id}", f"Division {division_id}"
+            )
+            divisions_to_insert.append((year, division_id, div_name, team_id))
+
+    print(f" -> Fetched {len(teams_to_insert)} teams.")
+
+    # 2. Matchups, Lineups & Efficiency
+    print("[3/6] Scraping weekly matchups, starting lineups, and manager efficiency...")
+    games_to_insert = []
+    lineups_to_insert = []
+    efficiency_to_insert = []
+    roster_positions = league_info.get("roster_positions", [])
+    valid_championship_teams = get_championship_path_rosters(league_id, playoff_week_start)
+
+    for week in range(1, 19):
+        matchups = fetch_json(f"{SLEEPER_BASE_URL}/league/{league_id}/matchups/{week}")
+        if not matchups:
+            continue
+
+        # Calculate Manager Efficiency for all participating rosters
+        for team_entry in matchups:
+            team_id = team_entry["roster_id"]
+            actual_score = float(team_entry.get("points", 0.0))
+            team_players = team_entry.get("players") or []
+            players_points = team_entry.get("players_points") or {}
+            roster_player_scores = {
+                str(pid): float(players_points.get(str(pid), 0.0))
+                for pid in team_players
+                if pid and pid != "0"
+            }
+
+            optimal_score = calculate_optimal_score(roster_positions, roster_player_scores, player_pos_map)
+            efficiency_pct = round((actual_score / optimal_score) * 100.0, 2) if optimal_score > 0 else (100.0 if actual_score == 0 else 0.0)
+            efficiency_to_insert.append((year, week, team_id, actual_score, optimal_score, efficiency_pct))
+
+        # Group games by matchup_id
+        matchup_groups: Dict[int, List[Dict[str, Any]]] = {}
+        for m in matchups:
+            m_id = m.get("matchup_id")
+            if m_id is not None:
+                matchup_groups.setdefault(m_id, []).append(m)
+
+        for m_id, paired_teams in matchup_groups.items():
+            is_playoff = week >= playoff_week_start
+
+            if is_playoff:
+                paired_teams = [t for t in paired_teams if (week, t["roster_id"]) in valid_championship_teams]
+                if not paired_teams:
+                    continue
+
+            current_game_id = int(f"{year}{week:02d}{m_id:02d}")
+
+            for team_entry in paired_teams:
+                team_id = team_entry["roster_id"]
+                team_score = float(team_entry.get("points", 0.0))
+                team_proj = 0.0
+
+                opponent_entry = next((t for t in paired_teams if t["roster_id"] != team_id), None)
+                if opponent_entry:
+                    opp_id = opponent_entry["roster_id"]
+                    opp_score = float(opponent_entry.get("points", 0.0))
+                    is_win = team_score > opp_score
+                    is_loss = team_score < opp_score
+                    is_tie = team_score == opp_score
+                else:
+                    opp_id = None
+                    is_win = True
+                    is_loss = False
+                    is_tie = False
+
+                games_to_insert.append((year, week, current_game_id, team_id, opp_id, team_score, team_proj, is_playoff, is_win, is_tie, is_loss))
+
+                all_roster_players = team_entry.get("players") or []
+                starters = team_entry.get("starters") or []
+                players_points = team_entry.get("players_points") or {}
+                starter_slots = [pos for pos in roster_positions if pos not in ("BN", "IR", "TAXI")]
+
+                starter_slot_map = {}
+                for idx, pid in enumerate(starters):
+                    if pid and pid != "0":
+                        starter_slot_map[str(pid)] = starter_slots[idx] if idx < len(starter_slots) else "FLEX"
+
+                team_reserve_set = roster_reserve_map.get(team_id, set())
+                team_taxi_set = roster_taxi_map.get(team_id, set())
+
+                for pid in all_roster_players:
+                    if not pid or pid == "0":
+                        continue
+
+                    pid_str = str(pid)
+                    p_info = all_players.get(pid_str, {})
+                    p_name = f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip() or pid_str
+                    pos = p_info.get("position", "Unknown")
+                    status = p_info.get("status", "Active")
+                    p_score = float(players_points.get(pid_str, 0.0))
+
+                    if pid_str in starter_slot_map:
+                        slot_pos = starter_slot_map[pid_str]
+                    elif pid_str in team_reserve_set:
+                        slot_pos = "IR"
+                    elif pid_str in team_taxi_set:
+                        slot_pos = "TAXI"
+                    else:
+                        slot_pos = "BN"
+
+                    try:
+                        p_id_int = int(pid)
+                    except ValueError:
+                        p_id_int = pid  # non-numeric ids (e.g. "SEA" for a D/ST) are valid Sleeper ids too
+
+                    lineups_to_insert.append((year, week, current_game_id, team_id, p_id_int, p_name, pos, slot_pos, status, p_score, 0.0))
+
+    print(f" -> Fetched {len(games_to_insert)} games, {len(lineups_to_insert)} lineups, {len(efficiency_to_insert)} efficiency rows.")
+
+    # 3. Transactions
+    print("[4/6] Scraping transactions...")
+    transactions_to_insert = []
+    pick_transactions_to_insert = []
+    for week in range(1, 19):
+        trans_url = f"{SLEEPER_BASE_URL}/league/{league_id}/transactions/{week}"
+        weekly_trans = fetch_json(trans_url)
+        if not weekly_trans:
+            continue
+
+        for t in weekly_trans:
+            if t.get("status") != "complete":
+                continue
+
+            trans_id = str(t.get("transaction_id"))
+            trans_type = t.get("type")
+
+            for pid, roster_id in (t.get("adds") or {}).items():
+                p_info = all_players.get(str(pid), {})
+                p_name = f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip() or str(pid)
+                transactions_to_insert.append((trans_id, roster_id, year, week, trans_type, "add", p_name))
+
+            for pid, roster_id in (t.get("drops") or {}).items():
+                p_info = all_players.get(str(pid), {})
+                p_name = f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip() or str(pid)
+                transactions_to_insert.append((trans_id, roster_id, year, week, trans_type, "drop", p_name))
+
+            for pick in (t.get("draft_picks") or []):
+                pick_transactions_to_insert.append((
+                    trans_id,
+                    year,
+                    week,
+                    int(pick.get("season")),
+                    pick.get("round"),
+                    pick.get("roster_id"),
+                    pick.get("previous_owner_id"),
+                    pick.get("owner_id"),
+                ))
+
+    print(f" -> Fetched {len(transactions_to_insert)} transactions, {len(pick_transactions_to_insert)} pick trade records.")
+
+    # 4. Draft Picks
+    print("[5/6] Scraping draft history...")
+    drafts = fetch_json(f"{SLEEPER_BASE_URL}/league/{league_id}/drafts")
+    draft_picks_to_insert = []
+
+    for draft in drafts:
+        if draft.get("status") != "complete":
+            continue
+
+        raw_draft_id = draft.get("draft_id")
+        if raw_draft_id == '1082380613652430848':
+            continue
+
+        draft_id_val = int("".join(filter(str.isdigit, str(raw_draft_id))) or 0)
+        draft_year = int(draft.get("season", year))
+
+        picks = fetch_json(f"{SLEEPER_BASE_URL}/draft/{raw_draft_id}/picks")
+
+        traded_picks = fetch_json(f"{SLEEPER_BASE_URL}/draft/{raw_draft_id}/traded_picks") or []
+        trade_map = {}
+        for tp in traded_picks:
+            r_id = tp.get("roster_id")
+            rnd = tp.get("round")
+            trade_map.setdefault((r_id, rnd), []).append({
+                "orig": tp.get("original_owner_id"),
+                "prev": tp.get("previous_owner_id")
+            })
+
+        for pick in picks:
+            round_num = pick.get("round")
+            pick_no = pick.get("draft_slot") or pick.get("pick_no")
+            team_id = pick.get("roster_id")
+            pid = pick.get("player_id")
+
+            try:
+                player_id = int(pid) if pid else None
+            except ValueError:
+                player_id = pid  # non-numeric ids (e.g. "SEA" for a D/ST) are valid Sleeper ids too
+
+            meta = pick.get("metadata") or {}
+            first_name = meta.get("first_name", "")
+            last_name = meta.get("last_name", "")
+            player_name = f"{first_name} {last_name}".strip()
+
+            if not player_name and pid:
+                p_info = all_players.get(str(pid), {})
+                player_name = f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip() or str(pid)
+
+            position = meta.get("position") or all_players.get(str(pid), {}).get("position", "Unknown")
+            nfl_team = meta.get("team") or all_players.get(str(pid), {}).get("team", "FA")
+
+            orig_roster_id = team_id
+            prev_roster_id = team_id
+
+            # If this team acquired a pick in this round via trade, consume one record
+            if (team_id, round_num) in trade_map and trade_map[(team_id, round_num)]:
+                trade_info = trade_map[(team_id, round_num)].pop(0)
+                orig_roster_id = trade_info["orig"] or team_id
+                prev_roster_id = trade_info["prev"] or orig_roster_id
+
+            original_roster = roster_owner_map.get(orig_roster_id, str(orig_roster_id))
+            previous_owner = roster_owner_map.get(prev_roster_id, str(prev_roster_id))
+            # ----------------------------------------------------
+
+            draft_picks_to_insert.append(
+                (
+                    draft_id_val,
+                    draft_year,
+                    round_num,
+                    pick_no,
+                    team_id,
+                    player_id,
+                    player_name,
+                    position,
+                    nfl_team,
+                    original_roster,
+                    previous_owner,
+                )
+            )
+
+    if draft_picks_to_insert:
+        print(f" -> Fetched {len(draft_picks_to_insert)} draft picks.")
+
+    return {
+        "year": year,
+        "league_info": league_info,
+        "teams": teams_to_insert,
+        "divisions": divisions_to_insert,
+        "games": games_to_insert,
+        "lineups": lineups_to_insert,
+        "manager_efficiency": efficiency_to_insert,
+        "transactions": transactions_to_insert,
+        "pick_transactions": pick_transactions_to_insert,
+        "draft_picks": draft_picks_to_insert,
+    }
+
+
+def fetch_league_dataframes(league_id: str) -> Dict[str, Any]:
+    """Same data as _fetch_raw_league_data(), as pandas DataFrames shaped
+    exactly like the corresponding dynasty_data.db tables (column names and
+    order match each table's schema). Never touches SQLite -- this is what
+    sleeper_live.py calls for live, non-persisted reads of an in-progress
+    season.
+    """
+    raw = _fetch_raw_league_data(league_id)
+    return {
+        "year": raw["year"],
+        "league_info": raw["league_info"],
+        "teams": pd.DataFrame(raw["teams"], columns=TEAMS_COLUMNS),
+        "divisions": pd.DataFrame(raw["divisions"], columns=DIVISIONS_COLUMNS),
+        "games": pd.DataFrame(raw["games"], columns=GAMES_COLUMNS),
+        "lineups": pd.DataFrame(raw["lineups"], columns=LINEUPS_COLUMNS),
+        "manager_efficiency": pd.DataFrame(raw["manager_efficiency"], columns=MANAGER_EFFICIENCY_COLUMNS),
+        "transactions": pd.DataFrame(raw["transactions"], columns=TRANSACTIONS_COLUMNS),
+        "pick_transactions": pd.DataFrame(raw["pick_transactions"], columns=PICK_TRANSACTIONS_COLUMNS),
+        "draft_picks": pd.DataFrame(raw["draft_picks"], columns=DRAFT_PICKS_COLUMNS),
+    }
+
+
+def populate_league_data(league_id: str, db_path: str = DB_PATH):
+    try:
+        raw = _fetch_raw_league_data(league_id)
+    except requests.exceptions.HTTPError as e:
+        print(f"Error fetching league: {e}. Please check that the League ID is valid.")
+        return
+
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
     try:
-        # 1. Teams & Divisions
-        # (standings is a derived table now -- see build_standings.py -- not written here)
-        teams_to_insert = []
-        divisions_to_insert = []
-
-        for r in rosters:
-            team_id = r["roster_id"]
-            owner_id = r.get("owner_id")
-            user = user_map.get(owner_id, {})
-
-            owner_name = user.get("display_name", f"Owner_{team_id}")
-            team_name = (
-                r.get("metadata", {}).get("team_name")
-                or user.get("metadata", {}).get("team_name")
-                or f"{owner_name}'s Team"
-            )
-            teams_to_insert.append((year, team_id, owner_name, team_name))
-
-            division_id = r.get("settings", {}).get("division")
-            if division_id is not None:
-                div_name = league_info.get("metadata", {}).get(
-                    f"division_{division_id}", f"Division {division_id}"
-                )
-                divisions_to_insert.append((year, division_id, div_name, team_id))
-
-        cur.executemany("INSERT OR REPLACE INTO teams (year, team_id, owner, team_name) VALUES (?, ?, ?, ?)", teams_to_insert)
-        if divisions_to_insert:
+        cur.executemany("INSERT OR REPLACE INTO teams (year, team_id, owner, team_name) VALUES (?, ?, ?, ?)", raw["teams"])
+        if raw["divisions"]:
             cur.executemany(
                 "INSERT OR REPLACE INTO divisions (year, division_id, division_name, team_id) VALUES (?, ?, ?, ?)",
-                divisions_to_insert,
+                raw["divisions"],
             )
-
-        print(f" -> Stored {len(teams_to_insert)} teams.")
-
-        # 2. Matchups, Lineups & Efficiency
-        print("[3/6] Scraping weekly matchups, starting lineups, and manager efficiency...")
-        games_to_insert = []
-        lineups_to_insert = []
-        efficiency_to_insert = []
-        roster_positions = league_info.get("roster_positions", [])
-        valid_championship_teams = get_championship_path_rosters(league_id, playoff_week_start)
-
-        for week in range(1, 19):
-            matchups = fetch_json(f"{SLEEPER_BASE_URL}/league/{league_id}/matchups/{week}")
-            if not matchups:
-                continue
-
-            # Calculate Manager Efficiency for all participating rosters
-            for team_entry in matchups:
-                team_id = team_entry["roster_id"]
-                actual_score = float(team_entry.get("points", 0.0))
-                team_players = team_entry.get("players") or []
-                players_points = team_entry.get("players_points") or {}
-                roster_player_scores = {
-                    str(pid): float(players_points.get(str(pid), 0.0))
-                    for pid in team_players
-                    if pid and pid != "0"
-                }
-
-                optimal_score = calculate_optimal_score(roster_positions, roster_player_scores, player_pos_map)
-                efficiency_pct = round((actual_score / optimal_score) * 100.0, 2) if optimal_score > 0 else (100.0 if actual_score == 0 else 0.0)
-                efficiency_to_insert.append((year, week, team_id, actual_score, optimal_score, efficiency_pct))
-
-            # Group games by matchup_id
-            matchup_groups: Dict[int, List[Dict[str, Any]]] = {}
-            for m in matchups:
-                m_id = m.get("matchup_id")
-                if m_id is not None:
-                    matchup_groups.setdefault(m_id, []).append(m)
-
-            for m_id, paired_teams in matchup_groups.items():
-                is_playoff = week >= playoff_week_start
-
-                if is_playoff:
-                    paired_teams = [t for t in paired_teams if (week, t["roster_id"]) in valid_championship_teams]
-                    if not paired_teams:
-                        continue
-
-                current_game_id = int(f"{year}{week:02d}{m_id:02d}")
-
-                for team_entry in paired_teams:
-                    team_id = team_entry["roster_id"]
-                    team_score = float(team_entry.get("points", 0.0))
-                    team_proj = 0.0
-
-                    opponent_entry = next((t for t in paired_teams if t["roster_id"] != team_id), None)
-                    if opponent_entry:
-                        opp_id = opponent_entry["roster_id"]
-                        opp_score = float(opponent_entry.get("points", 0.0))
-                        is_win = team_score > opp_score
-                        is_loss = team_score < opp_score
-                        is_tie = team_score == opp_score
-                    else:
-                        opp_id = None
-                        is_win = True
-                        is_loss = False
-                        is_tie = False
-
-                    games_to_insert.append((year, week, current_game_id, team_id, opp_id, team_score, team_proj, is_playoff, is_win, is_tie, is_loss))
-
-                    all_roster_players = team_entry.get("players") or []
-                    starters = team_entry.get("starters") or []
-                    players_points = team_entry.get("players_points") or {}
-                    starter_slots = [pos for pos in roster_positions if pos not in ("BN", "IR", "TAXI")]
-
-                    starter_slot_map = {}
-                    for idx, pid in enumerate(starters):
-                        if pid and pid != "0":
-                            starter_slot_map[str(pid)] = starter_slots[idx] if idx < len(starter_slots) else "FLEX"
-
-                    team_reserve_set = roster_reserve_map.get(team_id, set())
-                    team_taxi_set = roster_taxi_map.get(team_id, set())
-
-                    for pid in all_roster_players:
-                        if not pid or pid == "0":
-                            continue
-
-                        pid_str = str(pid)
-                        p_info = all_players.get(pid_str, {})
-                        p_name = f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip() or pid_str
-                        pos = p_info.get("position", "Unknown")
-                        status = p_info.get("status", "Active")
-                        p_score = float(players_points.get(pid_str, 0.0))
-
-                        if pid_str in starter_slot_map:
-                            slot_pos = starter_slot_map[pid_str]
-                        elif pid_str in team_reserve_set:
-                            slot_pos = "IR"
-                        elif pid_str in team_taxi_set:
-                            slot_pos = "TAXI"
-                        else:
-                            slot_pos = "BN"
-
-                        try:
-                            p_id_int = int(pid)
-                        except ValueError:
-                            p_id_int = pid  # non-numeric ids (e.g. "SEA" for a D/ST) are valid Sleeper ids too
-
-                        lineups_to_insert.append((year, week, current_game_id, team_id, p_id_int, p_name, pos, slot_pos, status, p_score, 0.0))
+        print(f" -> Stored {len(raw['teams'])} teams.")
 
         cur.executemany(
             """
@@ -288,7 +487,7 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
                 team_score, team_proj_score, is_playoff, is_win, is_tie, is_loss
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-            games_to_insert,
+            raw["games"],
         )
 
         cur.executemany(
@@ -299,7 +498,7 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
                 player_score, player_proj_score
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-            lineups_to_insert,
+            raw["lineups"],
         )
 
         cur.executemany(
@@ -308,55 +507,16 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
                 year, week, team_id, actual_score, optimal_score, efficiency_pct
             ) VALUES (?, ?, ?, ?, ?, ?)
         """,
-            efficiency_to_insert,
+            raw["manager_efficiency"],
         )
 
-        print(f" -> Stored {len(games_to_insert)} games, {len(lineups_to_insert)} lineups, {len(efficiency_to_insert)} efficiency rows.")
-
-        # 3. Transactions
-        print("[4/6] Scraping transactions...")
-        transactions_to_insert = []
-        pick_transactions_to_insert = []
-        for week in range(1, 19):
-            trans_url = f"{SLEEPER_BASE_URL}/league/{league_id}/transactions/{week}"
-            weekly_trans = fetch_json(trans_url)
-            if not weekly_trans:
-                continue
-
-            for t in weekly_trans:
-                if t.get("status") != "complete":
-                    continue
-
-                trans_id = str(t.get("transaction_id"))
-                trans_type = t.get("type")
-
-                for pid, roster_id in (t.get("adds") or {}).items():
-                    p_info = all_players.get(str(pid), {})
-                    p_name = f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip() or str(pid)
-                    transactions_to_insert.append((trans_id, roster_id, year, week, trans_type, "add", p_name))
-
-                for pid, roster_id in (t.get("drops") or {}).items():
-                    p_info = all_players.get(str(pid), {})
-                    p_name = f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip() or str(pid)
-                    transactions_to_insert.append((trans_id, roster_id, year, week, trans_type, "drop", p_name))
-
-                for pick in (t.get("draft_picks") or []):
-                    pick_transactions_to_insert.append((
-                        trans_id,
-                        year,
-                        week,
-                        int(pick.get("season")),
-                        pick.get("round"),
-                        pick.get("roster_id"),
-                        pick.get("previous_owner_id"),
-                        pick.get("owner_id"),
-                    ))
+        print(f" -> Stored {len(raw['games'])} games, {len(raw['lineups'])} lineups, {len(raw['manager_efficiency'])} efficiency rows.")
 
         cur.executemany(
             "INSERT OR REPLACE INTO transactions (trans_id, team_id, year, week, trans_type, action, player) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            transactions_to_insert,
+            raw["transactions"],
         )
-        print(f" -> Stored {len(transactions_to_insert)} transactions.")
+        print(f" -> Stored {len(raw['transactions'])} transactions.")
 
         cur.execute(
             """
@@ -380,91 +540,11 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
                 original_team_id, from_team_id, to_team_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            pick_transactions_to_insert,
+            raw["pick_transactions"],
         )
-        print(f" -> Stored {len(pick_transactions_to_insert)} pick trade records.")
+        print(f" -> Stored {len(raw['pick_transactions'])} pick trade records.")
 
-        # 4. Draft Picks
-        print("[5/6] Scraping draft history...")
-        drafts = fetch_json(f"{SLEEPER_BASE_URL}/league/{league_id}/drafts")
-        draft_picks_to_insert = []
-
-        for draft in drafts:
-            if draft.get("status") != "complete":
-                continue
-
-            raw_draft_id = draft.get("draft_id")
-            if raw_draft_id == '1082380613652430848':
-                continue
-
-            draft_id_val = int("".join(filter(str.isdigit, str(raw_draft_id))) or 0)
-            draft_year = int(draft.get("season", year))
-
-            picks = fetch_json(f"{SLEEPER_BASE_URL}/draft/{raw_draft_id}/picks")
-
-            traded_picks = fetch_json(f"{SLEEPER_BASE_URL}/draft/{raw_draft_id}/traded_picks") or []
-            trade_map = {}
-            for tp in traded_picks:
-                r_id = tp.get("roster_id")
-                rnd = tp.get("round")
-                trade_map.setdefault((r_id, rnd), []).append({
-                    "orig": tp.get("original_owner_id"),
-                    "prev": tp.get("previous_owner_id")
-                })
-
-            for pick in picks:
-                round_num = pick.get("round")
-                pick_no = pick.get("draft_slot") or pick.get("pick_no")
-                team_id = pick.get("roster_id")
-                pid = pick.get("player_id")
-
-                try:
-                    player_id = int(pid) if pid else None
-                except ValueError:
-                    player_id = pid  # non-numeric ids (e.g. "SEA" for a D/ST) are valid Sleeper ids too
-
-                meta = pick.get("metadata", {})
-                first_name = meta.get("first_name", "")
-                last_name = meta.get("last_name", "")
-                player_name = f"{first_name} {last_name}".strip()
-
-                if not player_name and pid:
-                    p_info = all_players.get(str(pid), {})
-                    player_name = f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip() or str(pid)
-
-                position = meta.get("position") or all_players.get(str(pid), {}).get("position", "Unknown")
-                nfl_team = meta.get("team") or all_players.get(str(pid), {}).get("team", "FA")
-
-                orig_roster_id = team_id
-                prev_roster_id = team_id
-
-                # If this team acquired a pick in this round via trade, consume one record
-                if (team_id, round_num) in trade_map and trade_map[(team_id, round_num)]:
-                    trade_info = trade_map[(team_id, round_num)].pop(0)
-                    orig_roster_id = trade_info["orig"] or team_id
-                    prev_roster_id = trade_info["prev"] or orig_roster_id
-
-                original_roster = roster_owner_map.get(orig_roster_id, str(orig_roster_id))
-                previous_owner = roster_owner_map.get(prev_roster_id, str(prev_roster_id))
-                # ----------------------------------------------------
-
-                draft_picks_to_insert.append(
-                    (
-                        draft_id_val,
-                        draft_year,
-                        round_num,
-                        pick_no,
-                        team_id,
-                        player_id,
-                        player_name,
-                        position,
-                        nfl_team,
-                        original_roster,
-                        previous_owner,
-                    )
-                )
-
-        if draft_picks_to_insert:
+        if raw["draft_picks"]:
             cur.executemany(
                 """
                 INSERT OR REPLACE INTO draft_picks (
@@ -473,9 +553,9 @@ def populate_league_data(league_id: str, db_path: str = DB_PATH):
                     original_roster, previous_owner
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                draft_picks_to_insert,
+                raw["draft_picks"],
             )
-            print(f" -> Stored {len(draft_picks_to_insert)} draft picks.")
+            print(f" -> Stored {len(raw['draft_picks'])} draft picks.")
 
         print("[6/6] Committing changes to SQLite database...")
         conn.commit()
