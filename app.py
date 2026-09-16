@@ -7,7 +7,7 @@ import sleeper_live
 DB_PATH = "dynasty_data.db"
 
 st.set_page_config(
-    page_title="Dynasty League Hub",
+    page_title="The Dynasty Historical Register",
     page_icon="🏈",
     layout="wide"
 )
@@ -71,6 +71,23 @@ def load_manager_efficiency():
 
 
 @st.cache_data(ttl=600)
+def load_champions():
+    conn = get_connection()
+    query = """
+        SELECT
+            c.year,
+            COALESCE(o.real_name, t.owner) AS champion_name
+        FROM champions c
+        JOIN teams t ON c.year = t.year AND c.champion_team_id = t.team_id
+        LEFT JOIN owners o ON t.owner = o.username
+        ORDER BY c.year;
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=600)
 def load_draft_picks():
     conn = get_connection()
     query = """
@@ -85,6 +102,27 @@ def load_draft_picks():
         FROM draft_picks d
         LEFT JOIN owners o ON d.original_roster = o.username
         ORDER BY d.year DESC, d.round ASC, d.pick_no ASC;
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=600)
+def load_expansion_draft():
+    conn = get_connection()
+    query = """
+        SELECT
+            e.phase,
+            e.round,
+            COALESCE(o.real_name, e.owner) AS manager_name,
+            e.taken_from,
+            COALESCE(p.player_name, 'Player ' || e.player_id) AS player_name,
+            p.player_position
+        FROM expansion_draft e
+        LEFT JOIN (SELECT DISTINCT owner_id, real_name FROM owners) o ON e.owner = o.owner_id
+        LEFT JOIN players p ON e.player_id = p.player_id
+        ORDER BY e.phase, e.round, manager_name;
     """
     df = pd.read_sql_query(query, conn)
     conn.close()
@@ -115,13 +153,39 @@ def load_live_standings():
 
 
 # --- UI & Layout ---
-st.title("🏈 Dynasty League Dashboard")
-
-tab_standings, tab_eff, tab_draft = st.tabs(
-    ["Standings & Records", "Manager Efficiency", "Rookie Drafts"]
+st.markdown(
+    """
+    <style>
+    div[data-baseweb="tab-list"] {
+        justify-content: center;
+    }
+    </style>
+    <h1 style='text-align: center;'>The Dynasty Historical Register</h1>
+    """,
+    unsafe_allow_html=True,
 )
 
-# --- TAB 1: Standings ---
+(
+    tab_standings,
+    tab_eff,
+    tab_point_records,
+    tab_wins_losses,
+    tab_h2h,
+    tab_draft,
+    tab_expansion,
+) = st.tabs(
+    [
+        "Yearly Summary",
+        "Manager Efficiency",
+        "Point Records",
+        "Wins and Losses",
+        "Head-to-Head Records",
+        "Draft History",
+        "Expansion Draft",
+    ]
+)
+
+# --- TAB: Yearly Summary ---
 STANDINGS_SORT_COLS = ["wins", "points_for", "points_against"]
 STANDINGS_SORT_ASC = [False, False, True]  # most wins, then most PF, then fewest PA
 STANDINGS_DISPLAY_COLS = ["manager_name", "team_name", "wins", "losses", "ties", "points_for", "points_against", "max_pf"]
@@ -136,7 +200,30 @@ STANDINGS_DISPLAY_RENAME = {
     "max_pf": "Max PF",
 }
 
+
+def full_height(df: pd.DataFrame) -> int:
+    """Pixel height that fits every row of df with no internal scrollbar."""
+    return 38 + 35 * len(df) + 3
+
 with tab_standings:
+    champions_df = load_champions()
+    if not champions_df.empty:
+        st.markdown(
+            "<h3 style='text-align:center'><strong><em>Champions</em></strong></h3>",
+            unsafe_allow_html=True,
+        )
+        champ_cols = st.columns(len(champions_df))
+        for col, (_, row) in zip(champ_cols, champions_df.iterrows()):
+            with col:
+                st.markdown(
+                    f"<div style='text-align:center'>"
+                    f"<div style='font-weight:600'>{row['year']}</div>"
+                    f"<div style='font-size:0.85em'>{row['champion_name']}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+        st.divider()
+
     standings_df = load_standings()
 
     live_standings_df = pd.DataFrame()
@@ -191,22 +278,26 @@ with tab_standings:
             ):
                 st.markdown(f"**{division_name if pd.notna(division_name) else 'No Division'}**")
                 group_sorted = group.sort_values(STANDINGS_SORT_COLS, ascending=STANDINGS_SORT_ASC)
+                display_group = group_sorted[STANDINGS_DISPLAY_COLS].rename(columns=STANDINGS_DISPLAY_RENAME)
                 st.dataframe(
-                    group_sorted[STANDINGS_DISPLAY_COLS].rename(columns=STANDINGS_DISPLAY_RENAME),
+                    display_group,
                     use_container_width=True,
                     hide_index=True,
+                    height=full_height(display_group),
                 )
         else:
             league_sorted = filtered_standings.sort_values(STANDINGS_SORT_COLS, ascending=STANDINGS_SORT_ASC)
+            display_league = league_sorted[STANDINGS_DISPLAY_COLS].rename(columns=STANDINGS_DISPLAY_RENAME)
             st.dataframe(
-                league_sorted[STANDINGS_DISPLAY_COLS].rename(columns=STANDINGS_DISPLAY_RENAME),
+                display_league,
                 use_container_width=True,
                 hide_index=True,
+                height=full_height(display_league),
             )
     else:
         st.info("No standings records found in the database.")
 
-# --- TAB 2: Manager Efficiency ---
+# --- TAB: Manager Efficiency ---
 with tab_eff:
     eff_df = load_manager_efficiency()
     if not eff_df.empty:
@@ -253,7 +344,19 @@ with tab_eff:
     else:
         st.info("No manager efficiency records found in the database.")
 
-# --- TAB 3: Rookie Drafts ---
+# --- TAB: Point Records ---
+with tab_point_records:
+    st.info("Coming soon.")
+
+# --- TAB: Wins and Losses ---
+with tab_wins_losses:
+    st.info("Coming soon.")
+
+# --- TAB: Head-to-Head Records ---
+with tab_h2h:
+    st.info("Coming soon.")
+
+# --- TAB: Draft History ---
 with tab_draft:
     draft_df = load_draft_picks()
     if not draft_df.empty:
@@ -277,3 +380,27 @@ with tab_draft:
         )
     else:
         st.info("No draft records found in the database.")
+
+# --- TAB: Expansion Draft ---
+with tab_expansion:
+    expansion_df = load_expansion_draft()
+    if not expansion_df.empty:
+        phases = list(expansion_df["phase"].unique())
+        selected_phase = st.selectbox("Select Phase", phases, key="expansion_phase")
+
+        filtered_expansion = expansion_df[expansion_df["phase"] == selected_phase]
+        st.dataframe(
+            filtered_expansion[[
+                "round", "manager_name", "taken_from", "player_name", "player_position"
+            ]].rename(columns={
+                "round": "Round",
+                "manager_name": "Manager",
+                "taken_from": "Taken From",
+                "player_name": "Player",
+                "player_position": "Pos",
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No expansion draft records found in the database.")
