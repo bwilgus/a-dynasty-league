@@ -1,2 +1,18 @@
-- Recover 2017 and 2018 data via espn_scraper_2017_2018 and transaction_test along with Gemini convo
-- streamlit
+Create table that shows progression of teams between owners
+ex: Michael became Derek, Alan became Steven, etc. 
+
+All-Star teams?
+- Based on how much they scored while not on the bench?
+
+Best/Worst Record
+
+Longest Winning Streak
+
+Greatest Player Performance
+
+Highest Score in a Loss
+
+Lowest Score in a Win
+
+Championship Game history by Lineup
+

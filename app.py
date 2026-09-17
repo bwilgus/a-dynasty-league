@@ -171,6 +171,40 @@ GAME_RESULTS_COLUMNS = [
 
 
 @st.cache_data(ttl=600)
+def load_all_games_detail():
+    """Every game (regular season and playoff) with opponent/score detail
+    and the years.modern_era flag, for the Point Records tab. Unlike
+    load_game_results(), this is not restricted to regular season -- the
+    Point Records filters need to be able to isolate playoff games too.
+    """
+    conn = get_connection()
+    query = """
+        SELECT
+            g.year,
+            g.week,
+            g.is_playoff,
+            COALESCE(o.real_name, t.owner) AS manager_name,
+            COALESCE(oo.real_name, ot.owner) AS opponent_name,
+            g.team_score,
+            g2.team_score AS opponent_score,
+            y.modern_era
+        FROM games g
+        JOIN teams t ON g.year = t.year AND g.team_id = t.team_id
+        LEFT JOIN owners o ON t.owner = o.username
+        JOIN games g2 ON g.year = g2.year AND g.week = g2.week AND g.opponent_team_id = g2.team_id
+        JOIN teams ot ON g2.year = ot.year AND g2.team_id = ot.team_id
+        LEFT JOIN owners oo ON ot.owner = oo.username
+        LEFT JOIN years y ON CAST(g.year AS TEXT) = y.year
+        ORDER BY g.year, g.week;
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    df["is_playoff"] = df["is_playoff"].astype(bool)
+    df["modern_era"] = df["modern_era"].astype(bool)
+    return df
+
+
+@st.cache_data(ttl=600)
 def load_owner_name_map():
     """username -> real_name, for resolving live-season data (which only
     knows Sleeper usernames/display names) to the same real names used
@@ -300,9 +334,9 @@ STANDINGS_DISPLAY_RENAME = {
 
 STANDINGS_COLUMN_FORMAT = {
     "W": "{:.0f}",
-    "PF": "{:.2f}",
-    "PA": "{:.2f}",
-    "Max PF": "{:.2f}",
+    "PF": "{:,.2f}",
+    "PA": "{:,.2f}",
+    "Max PF": "{:,.2f}",
 }
 
 
@@ -339,6 +373,18 @@ def zebra_striped(df: pd.DataFrame):
 
 def render_standings_table(df: pd.DataFrame):
     st.markdown(zebra_striped(df).to_html(), unsafe_allow_html=True)
+
+
+def comma_format(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """Formats the given point-value columns as comma-grouped, fixed
+    2-decimal strings (e.g. 19,901.84) -- trades away numeric click-to-sort
+    on just these columns, which is acceptable here since each table is
+    already ranked by its defining metric.
+    """
+    df = df.copy()
+    for col in columns:
+        df[col] = df[col].map("{:,.2f}".format)
+    return df
 
 
 with tab_standings:
@@ -666,7 +712,172 @@ with tab_eff:
 
 # --- TAB: Point Records ---
 with tab_point_records:
-    st.info("Coming soon.")
+    games_detail_df = load_all_games_detail()
+
+    if games_detail_df.empty:
+        st.info("No game records found in the database.")
+    else:
+        pr_col1, pr_col2, pr_col3, pr_col4, pr_col5 = st.columns(5)
+        pr_season_type = pr_col1.selectbox(
+            "Season Type", ["All", "Regular Season", "Playoff"], key="pr_season_type"
+        )
+        pr_modern_era = pr_col2.selectbox(
+            "Modern Era", ["All", "True", "False"], key="pr_modern_era"
+        )
+        pr_direction = pr_col3.radio(
+            "Highest/Lowest", ["Highest", "Lowest"], horizontal=True, key="pr_direction"
+        )
+        pr_top_n = pr_col4.selectbox(
+            "Highest/Lowest N", [5, 10, 25, 50, 100], index=1, key="pr_top_n"
+        )
+        max_seasons = games_detail_df["year"].nunique()
+        pr_min_seasons = pr_col5.number_input(
+            "Minimum Seasons", min_value=0, max_value=max_seasons, value=0, step=1, key="pr_min_seasons",
+        )
+        pr_ascending = pr_direction == "Lowest"
+
+        pr_filtered = games_detail_df.copy()
+        if pr_season_type == "Regular Season":
+            pr_filtered = pr_filtered[~pr_filtered["is_playoff"]]
+        elif pr_season_type == "Playoff":
+            pr_filtered = pr_filtered[pr_filtered["is_playoff"]]
+        if pr_modern_era != "All":
+            pr_filtered = pr_filtered[pr_filtered["modern_era"] == (pr_modern_era == "True")]
+
+        if pr_min_seasons > 0:
+            seasons_played_map = pr_filtered.groupby("manager_name")["year"].nunique()
+            qualified_owners = seasons_played_map[seasons_played_map >= pr_min_seasons].index
+            pr_filtered = pr_filtered[pr_filtered["manager_name"].isin(qualified_owners)]
+
+        st.divider()
+
+        if pr_filtered.empty:
+            st.info("No games match the selected filters.")
+        else:
+            # --- Points All Time ---
+            st.markdown("**Points All Time**")
+            all_time = pr_filtered.groupby("manager_name").agg(
+                seasons_played=("year", "nunique"),
+                points_for=("team_score", "sum"),
+                points_against=("opponent_score", "sum"),
+            ).reset_index()
+            all_time["points_differential"] = all_time["points_for"] - all_time["points_against"]
+            all_time = all_time.sort_values("points_for", ascending=pr_ascending).head(pr_top_n).reset_index(drop=True)
+            all_time.insert(0, "Rank", range(1, len(all_time) + 1))
+            all_time = all_time.round(2).rename(columns={
+                "manager_name": "Owner",
+                "seasons_played": "Seasons Played",
+                "points_for": "Points For",
+                "points_against": "Points Against",
+                "points_differential": "Points Differential",
+            })
+            all_time = comma_format(all_time, ["Points For", "Points Against", "Points Differential"])
+            st.dataframe(
+                all_time[["Rank", "Owner", "Seasons Played", "Points For", "Points Against", "Points Differential"]],
+                use_container_width=True, hide_index=True,
+            )
+
+            # --- Points Per Game ---
+            st.markdown("**Points Per Game**")
+            per_game = pr_filtered.groupby("manager_name").agg(
+                seasons_played=("year", "nunique"),
+                games_played=("year", "size"),
+                points_for=("team_score", "sum"),
+                points_against=("opponent_score", "sum"),
+            ).reset_index()
+            per_game["points_for"] = per_game["points_for"] / per_game["games_played"]
+            per_game["points_against"] = per_game["points_against"] / per_game["games_played"]
+            per_game["points_differential"] = per_game["points_for"] - per_game["points_against"]
+            per_game = per_game.sort_values("points_for", ascending=pr_ascending).head(pr_top_n).reset_index(drop=True)
+            per_game.insert(0, "Rank", range(1, len(per_game) + 1))
+            per_game = per_game.round(2).rename(columns={
+                "manager_name": "Owner",
+                "seasons_played": "Seasons Played",
+                "points_for": "Points For",
+                "points_against": "Points Against",
+                "points_differential": "Points Differential",
+            })
+            per_game = comma_format(per_game, ["Points For", "Points Against", "Points Differential"])
+            st.dataframe(
+                per_game[["Rank", "Owner", "Seasons Played", "Points For", "Points Against", "Points Differential"]],
+                use_container_width=True, hide_index=True,
+            )
+
+            # --- Highest Single Season Scores ---
+            st.markdown("**Highest Single Season Scores**")
+            season_scores = pr_filtered.groupby(["manager_name", "year"]).agg(
+                season_points=("team_score", "sum"),
+                points_against=("opponent_score", "sum"),
+            ).reset_index()
+            season_scores["points_differential"] = season_scores["season_points"] - season_scores["points_against"]
+            season_scores = season_scores.sort_values(
+                "season_points", ascending=pr_ascending
+            ).head(pr_top_n).reset_index(drop=True)
+            season_scores.insert(0, "Rank", range(1, len(season_scores) + 1))
+            season_scores = season_scores.round(2).rename(columns={
+                "season_points": "Season Points",
+                "manager_name": "Owner",
+                "year": "Year",
+                "points_against": "Points Against",
+                "points_differential": "Points Differential",
+            })
+            season_scores = comma_format(season_scores, ["Season Points", "Points Against", "Points Differential"])
+            st.dataframe(
+                season_scores[["Rank", "Season Points", "Owner", "Year", "Points Against", "Points Differential"]],
+                use_container_width=True, hide_index=True,
+            )
+
+            # --- Highest Single Game Score ---
+            st.markdown("**Highest Single Game Score**")
+            game_scores = pr_filtered.copy()
+            game_scores["points_differential"] = game_scores["team_score"] - game_scores["opponent_score"]
+            game_scores = game_scores.sort_values(
+                "team_score", ascending=pr_ascending
+            ).head(pr_top_n).reset_index(drop=True)
+            game_scores.insert(0, "Rank", range(1, len(game_scores) + 1))
+            game_scores = game_scores.round(2).rename(columns={
+                "team_score": "Points",
+                "manager_name": "Owner",
+                "opponent_name": "Opponent",
+                "year": "Year",
+                "week": "Week",
+                "is_playoff": "Playoff Game?",
+                "opponent_score": "Points Against",
+                "points_differential": "Points Differential",
+            })
+            game_scores = comma_format(game_scores, ["Points", "Points Against", "Points Differential"])
+            st.dataframe(
+                game_scores[[
+                    "Rank", "Points", "Owner", "Opponent", "Year", "Week",
+                    "Playoff Game?", "Points Against", "Points Differential",
+                ]],
+                use_container_width=True, hide_index=True,
+            )
+
+            # --- Highest Point Margins ---
+            st.markdown("**Highest Point Margins**")
+            margins = pr_filtered.copy()
+            margins["margin"] = margins["team_score"] - margins["opponent_score"]
+            margins = margins.sort_values("margin", ascending=pr_ascending).head(pr_top_n).reset_index(drop=True)
+            margins.insert(0, "Rank", range(1, len(margins) + 1))
+            margins = margins.round(2).rename(columns={
+                "margin": "Margin",
+                "manager_name": "Owner",
+                "opponent_name": "Opponent",
+                "year": "Year",
+                "week": "Week",
+                "is_playoff": "Playoff Game?",
+                "team_score": "Points For",
+                "opponent_score": "Points Against",
+            })
+            margins = comma_format(margins, ["Margin", "Points For", "Points Against"])
+            st.dataframe(
+                margins[[
+                    "Rank", "Margin", "Owner", "Opponent", "Year", "Week",
+                    "Playoff Game?", "Points For", "Points Against",
+                ]],
+                use_container_width=True, hide_index=True,
+            )
 
 # --- TAB: Wins and Losses ---
 with tab_wins_losses:
