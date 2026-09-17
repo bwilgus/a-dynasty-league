@@ -248,6 +248,14 @@ st.markdown(
     div[data-baseweb="tab-list"] {
         justify-content: center;
     }
+    table.standings-table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    table.standings-table th, table.standings-table td {
+        padding: 8px 12px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+    }
     </style>
     <h1 style='text-align: center;'>The Dynasty Historical Register</h1>
     """,
@@ -300,36 +308,37 @@ STANDINGS_COLUMN_FORMAT = {
 
 def zebra_striped(df: pd.DataFrame):
     """Styler with a faint highlight on every other row, centered headers and
-    cells, and STANDINGS_COLUMN_FORMAT number formatting. Rendered via
-    st.table rather than st.dataframe -- the latter's grid renderer ignores
-    text-align (and most other CSS) from a Styler. st.table's own renderer
-    sets its own inline-priority left/right alignment per column dtype, which
-    beats a plain Styler rule -- '!important' is needed to actually win.
+    cells, and STANDINGS_COLUMN_FORMAT number formatting.
 
-    The index is blanked out by overwriting its actual labels with empty
-    strings (not Styler's .hide(axis="index") / .format_index(), which
-    Streamlit's st.table marshalling ignores entirely -- confirmed the index
-    column and its header cell render regardless of either). That makes the
-    index non-unique, and pandas Styler's .apply()/.map() -- which
-    .set_properties() also wraps internally -- refuse to run against a
-    non-unique index, so all styling here (striping, alignment) is done as
-    plain CSS via set_table_styles instead, with no per-cell/per-row
-    Python function.
+    Rendered as raw HTML via st.markdown (see render_standings_table) rather
+    than st.table or st.dataframe: st.dataframe's grid renderer ignores
+    text-align from a Styler entirely, and st.table's Styler marshalling
+    both ignores .hide(axis="index") (the index column renders regardless)
+    and applies its own left/right text-align that beats a plain Styler
+    rule. Neither is fixable from the Styler side -- raw HTML has neither
+    problem, so .hide(axis="index") actually works and plain text-align
+    (no !important) is enough.
     """
     df = df.reset_index(drop=True)
-    df.index = [""] * len(df)
+
+    def _stripe(row):
+        style = "background-color: rgba(255, 255, 255, 0.06)" if row.name % 2 else ""
+        return [style] * len(row)
+
     format_spec = {col: fmt for col, fmt in STANDINGS_COLUMN_FORMAT.items() if col in df.columns}
     return (
         df.style
+        .hide(axis="index")
+        .apply(_stripe, axis=1)
         .format(format_spec)
-        .set_table_styles([
-            {"selector": "th, td", "props": [("text-align", "center !important")]},
-            {
-                "selector": "tbody tr:nth-child(even)",
-                "props": [("background-color", "rgba(255, 255, 255, 0.06)")],
-            },
-        ])
+        .set_properties(**{"text-align": "center"})
+        .set_table_styles([{"selector": "th", "props": [("text-align", "center")]}])
+        .set_table_attributes('class="standings-table"')
     )
+
+
+def render_standings_table(df: pd.DataFrame):
+    st.markdown(zebra_striped(df).to_html(), unsafe_allow_html=True)
 
 
 with tab_standings:
@@ -384,6 +393,17 @@ with tab_standings:
             horizontal=True, key="standings_view_mode"
         )
 
+        sort_col_1, sort_col_2 = st.columns(2)
+        sort_by = sort_col_1.selectbox(
+            "Sort by", list(STANDINGS_DISPLAY_RENAME.values()),
+            index=list(STANDINGS_DISPLAY_RENAME.values()).index("W"),
+            key="standings_sort_by",
+        )
+        sort_order = sort_col_2.radio(
+            "Order", ["Descending", "Ascending"], horizontal=True, key="standings_sort_order",
+        )
+        sort_ascending = sort_order == "Ascending"
+
         if selected_year in live_years and live_meta:
             st.caption(
                 f"Live from Sleeper — through week {live_meta['last_played_week']}, "
@@ -397,13 +417,13 @@ with tab_standings:
                 ["division_id", "division_name"], dropna=False
             ):
                 st.markdown(f"**{division_name if pd.notna(division_name) else 'No Division'}**")
-                group_sorted = group.sort_values(STANDINGS_SORT_COLS, ascending=STANDINGS_SORT_ASC)
-                display_group = group_sorted[STANDINGS_DISPLAY_COLS].rename(columns=STANDINGS_DISPLAY_RENAME)
-                st.table(zebra_striped(display_group))
+                display_group = group[STANDINGS_DISPLAY_COLS].rename(columns=STANDINGS_DISPLAY_RENAME)
+                display_group = display_group.sort_values(sort_by, ascending=sort_ascending)
+                render_standings_table(display_group)
         else:
-            league_sorted = filtered_standings.sort_values(STANDINGS_SORT_COLS, ascending=STANDINGS_SORT_ASC)
-            display_league = league_sorted[STANDINGS_DISPLAY_COLS].rename(columns=STANDINGS_DISPLAY_RENAME)
-            st.table(zebra_striped(display_league))
+            display_league = filtered_standings[STANDINGS_DISPLAY_COLS].rename(columns=STANDINGS_DISPLAY_RENAME)
+            display_league = display_league.sort_values(sort_by, ascending=sort_ascending)
+            render_standings_table(display_league)
 
         st.divider()
 
