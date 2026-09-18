@@ -1406,7 +1406,99 @@ with tab_wins_losses:
 
 # --- TAB: Head-to-Head Records ---
 with tab_h2h:
-    st.info("Coming soon.")
+    hh_games_detail_df = load_all_games_detail()
+    try:
+        hh_live_games_detail_df = load_live_games_detail()
+        if not hh_live_games_detail_df.empty:
+            hh_games_detail_df = pd.concat(
+                [hh_games_detail_df, hh_live_games_detail_df], ignore_index=True
+            )
+    except Exception as e:
+        st.warning(f"Couldn't fetch live game data from Sleeper: {e}")
+
+    if hh_games_detail_df.empty:
+        st.info("No game records found in the database.")
+    else:
+        hh_col1, hh_col2, hh_col3, hh_col4 = st.columns(4)
+        hh_season_type = hh_col1.selectbox(
+            "Season Type", ["All", "Regular Season", "Playoff"], key="hh_season_type"
+        )
+        hh_modern_era = hh_col2.selectbox(
+            "Modern Era", ["All", "True", "False"], key="hh_modern_era"
+        )
+        hh_all_years = sorted(hh_games_detail_df["year"].unique())
+        hh_seasons = hh_col3.multiselect(
+            "Seasons", hh_all_years, default=[], placeholder="All seasons", key="hh_seasons",
+        )
+        hh_min_games = hh_col4.number_input(
+            "Minimum Games", min_value=0, value=0, step=1, key="hh_min_games",
+        )
+
+        hh_filtered = hh_games_detail_df.copy()
+        if hh_seasons:
+            hh_filtered = hh_filtered[hh_filtered["year"].isin(hh_seasons)]
+        if hh_season_type == "Regular Season":
+            hh_filtered = hh_filtered[~hh_filtered["is_playoff"]]
+        elif hh_season_type == "Playoff":
+            hh_filtered = hh_filtered[hh_filtered["is_playoff"]]
+        if hh_modern_era != "All":
+            hh_filtered = hh_filtered[hh_filtered["modern_era"] == (hh_modern_era == "True")]
+
+        st.divider()
+
+        # --- Wins Against an Opponent / Winning Percentage ---
+        HH_TOP_N = 10
+
+        hh_pairs = hh_filtered.copy()
+        hh_pairs["is_win"] = hh_pairs["team_score"] > hh_pairs["opponent_score"]
+        hh_pairs["is_loss"] = hh_pairs["team_score"] < hh_pairs["opponent_score"]
+
+        hh_summary = hh_pairs.groupby(["manager_name", "opponent_name"]).agg(
+            games=("year", "size"),
+            wins=("is_win", "sum"),
+            losses=("is_loss", "sum"),
+        ).reset_index()
+        hh_summary["win_pct"] = (hh_summary["wins"] / hh_summary["games"]) * 100
+        if hh_min_games > 0:
+            hh_summary = hh_summary[hh_summary["games"] >= hh_min_games]
+
+        hh_wins = hh_summary.sort_values("wins", ascending=False).head(HH_TOP_N).reset_index(drop=True)
+        hh_wins.insert(0, "Rank", range(1, len(hh_wins) + 1))
+        hh_wins["Winning Percentage"] = hh_wins["win_pct"].map("{:.2f}%".format)
+        hh_wins = hh_wins.rename(columns={
+            "wins": "Wins",
+            "losses": "Losses",
+            "manager_name": "Owner",
+            "opponent_name": "Opponent",
+        })
+
+        hh_win_pct = hh_summary.sort_values(
+            "win_pct", ascending=False
+        ).head(HH_TOP_N).reset_index(drop=True)
+        hh_win_pct.insert(0, "Rank", range(1, len(hh_win_pct) + 1))
+        hh_win_pct["Winning Percentage"] = hh_win_pct["win_pct"].map("{:.2f}%".format)
+        hh_win_pct = hh_win_pct.rename(columns={
+            "manager_name": "Owner",
+            "opponent_name": "Opponent",
+            "wins": "Wins",
+            "losses": "Losses",
+        })
+
+        hh_table_col1, hh_table_col2 = st.columns(2)
+        show_table(
+            hh_table_col1, "Wins Against an Opponent", hh_wins,
+            ["Rank", "Wins", "Losses", "Owner", "Opponent", "Winning Percentage"],
+            "No games match the selected filters.",
+        )
+        show_table(
+            hh_table_col2, "Winning Percentage", hh_win_pct,
+            ["Rank", "Winning Percentage", "Owner", "Opponent", "Wins", "Losses"],
+            "No games match the selected filters.",
+        )
+
+        st.divider()
+
+        st.info("Coming soon.")
 
 # --- TAB: Draft History ---
 with tab_draft:
