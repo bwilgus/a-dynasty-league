@@ -275,6 +275,44 @@ def load_live_season_data():
     return standings, game_results, metadata
 
 
+@st.cache_data(ttl=300)
+def load_live_games_detail():
+    """Live equivalent of load_all_games_detail() for whatever Sleeper season
+    is currently in progress -- every played game (regular season and
+    playoff) with opponent/score detail, shaped identically so it can be
+    concatenated with load_all_games_detail()'s output for the Point Records
+    and Wins and Losses tabs. Never written to dynasty_data.db; see
+    load_live_season_data(). The season is always modern_era (bench/lineup
+    data exists), so that flag is hardcoded True rather than looked up.
+    """
+    live = sleeper_live.get_live_season_data()
+    games = live["games"]
+    teams = live["teams"]
+    columns = [
+        "year", "week", "is_playoff", "manager_name", "opponent_name",
+        "team_score", "opponent_score", "modern_era",
+    ]
+    if games.empty or teams.empty:
+        return pd.DataFrame(columns=columns)
+
+    opponent_scores = games[["team_id", "week", "team_score"]].rename(
+        columns={"team_id": "opponent_team_id", "team_score": "opponent_score"}
+    )
+    merged = games.merge(opponent_scores, on=["opponent_team_id", "week"], how="left")
+    merged = merged.merge(teams[["team_id", "owner"]], on="team_id", how="left")
+    merged = merged.rename(columns={"owner": "manager_name"})
+    merged = merged.merge(
+        teams[["team_id", "owner"]].rename(columns={"team_id": "opponent_team_id", "owner": "opponent_name"}),
+        on="opponent_team_id", how="left",
+    )
+    merged["year"] = live["year"]
+    merged["is_playoff"] = merged["is_playoff"].astype(bool)
+    merged["modern_era"] = True
+    merged = resolve_manager_names(merged)
+
+    return merged[columns]
+
+
 # --- UI & Layout ---
 st.markdown(
     """
@@ -289,6 +327,9 @@ st.markdown(
     table.standings-table th, table.standings-table td {
         padding: 8px 12px;
         border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+    }
+    table.record-table {
+        border: 2px solid rgba(128, 128, 128, 0.75);
     }
     </style>
     <h1 style='text-align: center;'>The Dynasty Historical Register</h1>
@@ -405,7 +446,7 @@ def render_centered_table(df: pd.DataFrame):
         df.style
         .hide(axis="index")
         .set_table_styles([{"selector": "th, td", "props": [("text-align", "center")]}])
-        .set_table_attributes('class="standings-table"')
+        .set_table_attributes('class="standings-table record-table"')
     )
     st.markdown(f'<div style="overflow-x: auto;">{styler.to_html()}</div>', unsafe_allow_html=True)
 
@@ -736,6 +777,14 @@ with tab_eff:
 # --- TAB: Point Records ---
 with tab_point_records:
     games_detail_df = load_all_games_detail()
+    try:
+        live_games_detail_df = load_live_games_detail()
+        if not live_games_detail_df.empty:
+            games_detail_df = pd.concat(
+                [games_detail_df, live_games_detail_df], ignore_index=True
+            )
+    except Exception as e:
+        st.warning(f"Couldn't fetch live game data from Sleeper: {e}")
 
     if games_detail_df.empty:
         st.info("No game records found in the database.")
@@ -1114,7 +1163,246 @@ with tab_point_records:
 
 # --- TAB: Wins and Losses ---
 with tab_wins_losses:
-    st.info("Coming soon.")
+    wl_games_detail_df = load_all_games_detail()
+    try:
+        wl_live_games_detail_df = load_live_games_detail()
+        if not wl_live_games_detail_df.empty:
+            wl_games_detail_df = pd.concat(
+                [wl_games_detail_df, wl_live_games_detail_df], ignore_index=True
+            )
+    except Exception as e:
+        st.warning(f"Couldn't fetch live game data from Sleeper: {e}")
+
+    if wl_games_detail_df.empty:
+        st.info("No game records found in the database.")
+    else:
+        wl_col1, wl_col2, wl_col3, wl_col4, wl_col5, wl_col6 = st.columns(6)
+        wl_season_type = wl_col1.selectbox(
+            "Season Type", ["All", "Regular Season", "Playoff"], key="wl_season_type"
+        )
+        wl_modern_era = wl_col2.selectbox(
+            "Modern Era", ["All", "True", "False"], key="wl_modern_era"
+        )
+        wl_direction = wl_col3.radio(
+            "Highest/Lowest", ["Highest", "Lowest"], horizontal=True, key="wl_direction"
+        )
+        wl_top_n = wl_col4.selectbox(
+            "Highest/Lowest N", [5, 10, 25, 50, 100], index=1, key="wl_top_n"
+        )
+        wl_max_seasons = wl_games_detail_df["year"].nunique()
+        wl_min_seasons = wl_col5.number_input(
+            "Minimum Seasons", min_value=0, max_value=wl_max_seasons, value=0, step=1, key="wl_min_seasons",
+        )
+        wl_all_years = sorted(wl_games_detail_df["year"].unique())
+        wl_seasons = wl_col6.multiselect(
+            "Seasons", wl_all_years, default=[], placeholder="All seasons", key="wl_seasons",
+        )
+        wl_ascending = wl_direction == "Lowest"
+
+        wl_filtered = wl_games_detail_df.copy()
+        if wl_seasons:
+            wl_filtered = wl_filtered[wl_filtered["year"].isin(wl_seasons)]
+        if wl_season_type == "Regular Season":
+            wl_filtered = wl_filtered[~wl_filtered["is_playoff"]]
+        elif wl_season_type == "Playoff":
+            wl_filtered = wl_filtered[wl_filtered["is_playoff"]]
+        if wl_modern_era != "All":
+            wl_filtered = wl_filtered[wl_filtered["modern_era"] == (wl_modern_era == "True")]
+
+        if wl_min_seasons > 0:
+            wl_seasons_played_map = wl_filtered.groupby("manager_name")["year"].nunique()
+            wl_qualified_owners = wl_seasons_played_map[wl_seasons_played_map >= wl_min_seasons].index
+            wl_filtered = wl_filtered[wl_filtered["manager_name"].isin(wl_qualified_owners)]
+
+        st.divider()
+
+        # --- Wins / Losses / Winning Percentage summary ---
+        wl_results = wl_filtered.copy()
+        wl_results["is_win"] = wl_results["team_score"] > wl_results["opponent_score"]
+        wl_results["is_loss"] = wl_results["team_score"] < wl_results["opponent_score"]
+
+        wl_summary = wl_results.groupby("manager_name").agg(
+            seasons_played=("year", "nunique"),
+            games_played=("year", "size"),
+            wins=("is_win", "sum"),
+            losses=("is_loss", "sum"),
+        ).reset_index()
+        wl_summary["winning_pct"] = (wl_summary["wins"] / wl_summary["games_played"]) * 100
+
+        # --- All Time Wins ---
+        all_time_wins = wl_summary.sort_values("wins", ascending=wl_ascending).head(wl_top_n).reset_index(drop=True)
+        all_time_wins.insert(0, "Rank", range(1, len(all_time_wins) + 1))
+        all_time_wins = all_time_wins.rename(columns={
+            "manager_name": "Owner",
+            "wins": "Wins",
+            "seasons_played": "Seasons",
+        })
+
+        # --- All Time Losses ---
+        all_time_losses = wl_summary.sort_values(
+            "losses", ascending=wl_ascending
+        ).head(wl_top_n).reset_index(drop=True)
+        all_time_losses.insert(0, "Rank", range(1, len(all_time_losses) + 1))
+        all_time_losses = all_time_losses.rename(columns={
+            "manager_name": "Owner",
+            "losses": "Losses",
+            "seasons_played": "Seasons",
+        })
+
+        # --- All Time Winning Percentage ---
+        all_time_win_pct = wl_summary.sort_values(
+            "winning_pct", ascending=wl_ascending
+        ).head(wl_top_n).reset_index(drop=True)
+        all_time_win_pct.insert(0, "Rank", range(1, len(all_time_win_pct) + 1))
+        all_time_win_pct = all_time_win_pct.rename(columns={
+            "manager_name": "Owner",
+            "games_played": "Games",
+            "seasons_played": "Seasons",
+        })
+        all_time_win_pct["Winning Percentage"] = all_time_win_pct["winning_pct"].map("{:.2f}%".format)
+
+        wl_row1_col1, wl_row1_col2, wl_row1_col3 = st.columns(3)
+        show_table(
+            wl_row1_col1, "All Time Wins", all_time_wins,
+            ["Rank", "Owner", "Wins", "Seasons"],
+            "No games match the selected filters.",
+        )
+        show_table(
+            wl_row1_col2, "All Time Losses", all_time_losses,
+            ["Rank", "Owner", "Losses", "Seasons"],
+            "No games match the selected filters.",
+        )
+        show_table(
+            wl_row1_col3, "All Time Winning Percentage", all_time_win_pct,
+            ["Rank", "Owner", "Winning Percentage", "Games", "Seasons"],
+            "No games match the selected filters.",
+        )
+
+        # --- Single Season Record / Win Percentage summary ---
+        wl_season_summary = wl_results.groupby(["manager_name", "year"]).agg(
+            games_played=("year", "size"),
+            wins=("is_win", "sum"),
+            losses=("is_loss", "sum"),
+            points_for=("team_score", "sum"),
+            points_against=("opponent_score", "sum"),
+        ).reset_index()
+        wl_season_summary["margin"] = wl_season_summary["points_for"] - wl_season_summary["points_against"]
+        wl_season_summary["win_pct"] = (wl_season_summary["wins"] / wl_season_summary["games_played"]) * 100
+
+        # --- Single Season Record ---
+        single_season_record = wl_season_summary.sort_values(
+            "wins", ascending=wl_ascending
+        ).head(wl_top_n).reset_index(drop=True)
+        single_season_record.insert(0, "Rank", range(1, len(single_season_record) + 1))
+        single_season_record = single_season_record.round(2).rename(columns={
+            "manager_name": "Owner",
+            "year": "Year",
+            "wins": "Wins",
+            "losses": "Losses",
+            "points_for": "Points For",
+            "points_against": "Points Against",
+            "margin": "Margin",
+        })
+        single_season_record = comma_format(single_season_record, ["Points For", "Points Against", "Margin"])
+
+        # --- Single Season Win Percentage ---
+        single_season_win_pct = wl_season_summary.sort_values(
+            "win_pct", ascending=wl_ascending
+        ).head(wl_top_n).reset_index(drop=True)
+        single_season_win_pct.insert(0, "Rank", range(1, len(single_season_win_pct) + 1))
+        single_season_win_pct = single_season_win_pct.round(2).rename(columns={
+            "manager_name": "Owner",
+            "year": "Year",
+            "wins": "Wins",
+            "losses": "Losses",
+            "points_for": "Points For",
+            "points_against": "Points Against",
+            "margin": "Margin",
+        })
+        single_season_win_pct["Win Percentage"] = single_season_win_pct["win_pct"].map("{:.2f}%".format)
+        single_season_win_pct = comma_format(
+            single_season_win_pct, ["Points For", "Points Against", "Margin"]
+        )
+
+        wl_row2_col1, wl_row2_col2 = st.columns(2)
+        show_table(
+            wl_row2_col1, "Single Season Record", single_season_record,
+            ["Rank", "Owner", "Year", "Wins", "Losses", "Points For", "Points Against", "Margin"],
+            "No games match the selected filters.",
+        )
+        show_table(
+            wl_row2_col2, "Single Season Win Percentage", single_season_win_pct,
+            ["Rank", "Owner", "Year", "Win Percentage", "Wins", "Losses", "Points For", "Points Against", "Margin"],
+            "No games match the selected filters.",
+        )
+
+        # --- Longest Winning / Losing Streaks ---
+        # Streaks are runs of consecutive same-result games in (year, week)
+        # order per manager -- a tie breaks both a winning and a losing
+        # streak, same as it breaks a real-life streak.
+        streak_df = wl_filtered.sort_values(["manager_name", "year", "week"]).reset_index(drop=True)
+        streak_df["result"] = np.select(
+            [streak_df["team_score"] > streak_df["opponent_score"],
+             streak_df["team_score"] < streak_df["opponent_score"]],
+            ["win", "loss"],
+            default="tie",
+        )
+        streak_df["streak_id"] = streak_df.groupby("manager_name")["result"].transform(
+            lambda s: (s != s.shift()).cumsum()
+        )
+
+        streaks = streak_df.groupby(["manager_name", "streak_id"]).agg(
+            result=("result", "first"),
+            length=("result", "size"),
+            start_year=("year", "first"),
+            start_week=("week", "first"),
+            end_year=("year", "last"),
+            end_week=("week", "last"),
+        ).reset_index(drop=False).drop(columns="streak_id")
+
+        streak_columns = ["Rank", "Owner", "Streak", "Start Year", "Start Week", "End Year", "End Week"]
+        streak_rename = {
+            "manager_name": "Owner",
+            "length": "Streak",
+            "start_year": "Start Year",
+            "start_week": "Start Week",
+            "end_year": "End Year",
+            "end_week": "End Week",
+        }
+
+        win_streaks = streaks[streaks["result"] == "win"]
+        if not win_streaks.empty:
+            longest_win_streak = win_streaks.loc[win_streaks.groupby("manager_name")["length"].idxmax()]
+            longest_win_streak = longest_win_streak.sort_values(
+                "length", ascending=wl_ascending
+            ).head(wl_top_n).reset_index(drop=True)
+            longest_win_streak.insert(0, "Rank", range(1, len(longest_win_streak) + 1))
+            longest_win_streak = longest_win_streak.rename(columns=streak_rename)
+        else:
+            longest_win_streak = pd.DataFrame(columns=streak_columns)
+
+        loss_streaks = streaks[streaks["result"] == "loss"]
+        if not loss_streaks.empty:
+            longest_loss_streak = loss_streaks.loc[loss_streaks.groupby("manager_name")["length"].idxmax()]
+            longest_loss_streak = longest_loss_streak.sort_values(
+                "length", ascending=wl_ascending
+            ).head(wl_top_n).reset_index(drop=True)
+            longest_loss_streak.insert(0, "Rank", range(1, len(longest_loss_streak) + 1))
+            longest_loss_streak = longest_loss_streak.rename(columns=streak_rename)
+        else:
+            longest_loss_streak = pd.DataFrame(columns=streak_columns)
+
+        wl_row3_col1, wl_row3_col2 = st.columns(2)
+        show_table(
+            wl_row3_col1, "Longest Winning Streak", longest_win_streak,
+            streak_columns,
+            "No games match the selected filters.",
+        )
+        show_table(
+            wl_row3_col2, "Longest Losing Streak", longest_loss_streak,
+            streak_columns,
+            "No games match the selected filters.",
+        )
 
 # --- TAB: Head-to-Head Records ---
 with tab_h2h:

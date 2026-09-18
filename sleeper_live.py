@@ -34,6 +34,18 @@ def get_current_league_id() -> Tuple[str, Dict[str, Any]]:
     return league_id, league_info
 
 
+def get_last_completed_nfl_week() -> int:
+    """The most recent NFL week whose games are all finished, per Sleeper's
+    global state endpoint. Sleeper advances state["week"] at the start of
+    the next real-world week (early Tuesday, right after Monday Night
+    Football) -- so state["week"] - 1 is the last week guaranteed to be
+    fully final. Used to exclude the current, possibly still in-progress,
+    week from live scoring (see get_live_season_data()).
+    """
+    state = fetch_json(f"{SLEEPER_BASE_URL}/state/nfl")
+    return int(state.get("week", 0)) - 1
+
+
 def get_live_season_data() -> Dict[str, Any]:
     """Fetches the current season's data in the same shape as dynasty_data.db.
 
@@ -55,6 +67,13 @@ def get_live_season_data() -> Dict[str, Any]:
         last_played_week = int(played_weeks.max()) if len(played_weeks) else 0
     else:
         last_played_week = 0
+
+    # The points-scored check above still lets a week in, in progress
+    # through, e.g. a Thursday-night game reports a nonzero score for two
+    # teams while the rest of that week's games haven't kicked off -- which
+    # would otherwise hand out win/loss records off unfinished matchups.
+    # Cap at the last NFL week Sleeper considers fully complete.
+    last_played_week = min(last_played_week, get_last_completed_nfl_week())
 
     frames["games"] = games[games["week"] <= last_played_week].reset_index(drop=True)
     frames["lineups"] = frames["lineups"][frames["lineups"]["week"] <= last_played_week].reset_index(drop=True)
