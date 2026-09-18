@@ -372,7 +372,13 @@ def zebra_striped(df: pd.DataFrame):
 
 
 def render_standings_table(df: pd.DataFrame):
-    st.markdown(zebra_striped(df).to_html(), unsafe_allow_html=True)
+    # Wrapped in a horizontally-scrollable div: a raw HTML table sizes to
+    # its content and will otherwise overflow past its container (bleeding
+    # into a neighboring st.columns() table) instead of wrapping/shrinking.
+    st.markdown(
+        f'<div style="overflow-x: auto;">{zebra_striped(df).to_html()}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def comma_format(df: pd.DataFrame, columns: list) -> pd.DataFrame:
@@ -385,6 +391,23 @@ def comma_format(df: pd.DataFrame, columns: list) -> pd.DataFrame:
     for col in columns:
         df[col] = df[col].map("{:,.2f}".format)
     return df
+
+
+def render_centered_table(df: pd.DataFrame):
+    """Renders a DataFrame as a plain, centered HTML table (headers and
+    cells), the same way render_standings_table does -- st.dataframe's grid
+    renderer ignores text-align from a Styler entirely, so centering only
+    actually works via raw HTML. Trades away st.dataframe's native
+    click-to-sort, scrolling, and boolean-checkbox rendering (booleans show
+    as plain True/False text instead).
+    """
+    styler = (
+        df.style
+        .hide(axis="index")
+        .set_table_styles([{"selector": "th, td", "props": [("text-align", "center")]}])
+        .set_table_attributes('class="standings-table"')
+    )
+    st.markdown(f'<div style="overflow-x: auto;">{styler.to_html()}</div>', unsafe_allow_html=True)
 
 
 with tab_standings:
@@ -717,7 +740,7 @@ with tab_point_records:
     if games_detail_df.empty:
         st.info("No game records found in the database.")
     else:
-        pr_col1, pr_col2, pr_col3, pr_col4, pr_col5 = st.columns(5)
+        pr_col1, pr_col2, pr_col3, pr_col4, pr_col5, pr_col6 = st.columns(6)
         pr_season_type = pr_col1.selectbox(
             "Season Type", ["All", "Regular Season", "Playoff"], key="pr_season_type"
         )
@@ -734,9 +757,15 @@ with tab_point_records:
         pr_min_seasons = pr_col5.number_input(
             "Minimum Seasons", min_value=0, max_value=max_seasons, value=0, step=1, key="pr_min_seasons",
         )
+        all_years = sorted(games_detail_df["year"].unique())
+        pr_seasons = pr_col6.multiselect(
+            "Seasons", all_years, default=[], placeholder="All seasons", key="pr_seasons",
+        )
         pr_ascending = pr_direction == "Lowest"
 
         pr_filtered = games_detail_df.copy()
+        if pr_seasons:
+            pr_filtered = pr_filtered[pr_filtered["year"].isin(pr_seasons)]
         if pr_season_type == "Regular Season":
             pr_filtered = pr_filtered[~pr_filtered["is_playoff"]]
         elif pr_season_type == "Playoff":
@@ -751,116 +780,247 @@ with tab_point_records:
 
         st.divider()
 
-        if pr_filtered.empty:
-            st.info("No games match the selected filters.")
-        else:
-            # --- Points All Time ---
-            st.markdown("**Points All Time**")
-            all_time = pr_filtered.groupby("manager_name").agg(
-                seasons_played=("year", "nunique"),
-                points_for=("team_score", "sum"),
-                points_against=("opponent_score", "sum"),
-            ).reset_index()
-            all_time["points_differential"] = all_time["points_for"] - all_time["points_against"]
-            all_time = all_time.sort_values("points_for", ascending=pr_ascending).head(pr_top_n).reset_index(drop=True)
-            all_time.insert(0, "Rank", range(1, len(all_time) + 1))
-            all_time = all_time.round(2).rename(columns={
-                "manager_name": "Owner",
-                "seasons_played": "Seasons Played",
-                "points_for": "Points For",
-                "points_against": "Points Against",
-                "points_differential": "Points Differential",
-            })
-            all_time = comma_format(all_time, ["Points For", "Points Against", "Points Differential"])
-            st.dataframe(
-                all_time[["Rank", "Owner", "Seasons Played", "Points For", "Points Against", "Points Differential"]],
-                use_container_width=True, hide_index=True,
-            )
+        # --- Points All Time ---
+        all_time = pr_filtered.groupby("manager_name").agg(
+            seasons_played=("year", "nunique"),
+            points_for=("team_score", "sum"),
+            points_against=("opponent_score", "sum"),
+        ).reset_index()
+        all_time["points_differential"] = all_time["points_for"] - all_time["points_against"]
+        all_time = all_time.sort_values("points_for", ascending=pr_ascending).head(pr_top_n).reset_index(drop=True)
+        all_time.insert(0, "Rank", range(1, len(all_time) + 1))
+        all_time = all_time.round(2).rename(columns={
+            "manager_name": "Owner",
+            "seasons_played": "Seasons Played",
+            "points_for": "Points For",
+            "points_against": "Points Against",
+            "points_differential": "Margin",
+        })
+        all_time = comma_format(all_time, ["Points For", "Points Against", "Margin"])
 
-            # --- Points Per Game ---
-            st.markdown("**Points Per Game**")
-            per_game = pr_filtered.groupby("manager_name").agg(
-                seasons_played=("year", "nunique"),
-                games_played=("year", "size"),
-                points_for=("team_score", "sum"),
-                points_against=("opponent_score", "sum"),
-            ).reset_index()
-            per_game["points_for"] = per_game["points_for"] / per_game["games_played"]
-            per_game["points_against"] = per_game["points_against"] / per_game["games_played"]
-            per_game["points_differential"] = per_game["points_for"] - per_game["points_against"]
-            per_game = per_game.sort_values("points_for", ascending=pr_ascending).head(pr_top_n).reset_index(drop=True)
-            per_game.insert(0, "Rank", range(1, len(per_game) + 1))
-            per_game = per_game.round(2).rename(columns={
-                "manager_name": "Owner",
-                "seasons_played": "Seasons Played",
-                "points_for": "Points For",
-                "points_against": "Points Against",
-                "points_differential": "Points Differential",
-            })
-            per_game = comma_format(per_game, ["Points For", "Points Against", "Points Differential"])
-            st.dataframe(
-                per_game[["Rank", "Owner", "Seasons Played", "Points For", "Points Against", "Points Differential"]],
-                use_container_width=True, hide_index=True,
-            )
+        # --- Points Against All Time ---
+        against_all_time = pr_filtered.groupby("manager_name").agg(
+            seasons_played=("year", "nunique"),
+            points_for=("team_score", "sum"),
+            points_against=("opponent_score", "sum"),
+        ).reset_index()
+        against_all_time["points_differential"] = against_all_time["points_for"] - against_all_time["points_against"]
+        against_all_time = against_all_time.sort_values(
+            "points_against", ascending=pr_ascending
+        ).head(pr_top_n).reset_index(drop=True)
+        against_all_time.insert(0, "Rank", range(1, len(against_all_time) + 1))
+        against_all_time = against_all_time.round(2).rename(columns={
+            "manager_name": "Owner",
+            "seasons_played": "Seasons Played",
+            "points_for": "Points For",
+            "points_against": "Points Against",
+            "points_differential": "Margin",
+        })
+        against_all_time = comma_format(against_all_time, ["Points For", "Points Against", "Margin"])
 
-            # --- Highest Single Season Scores ---
-            st.markdown("**Highest Single Season Scores**")
-            season_scores = pr_filtered.groupby(["manager_name", "year"]).agg(
-                season_points=("team_score", "sum"),
-                points_against=("opponent_score", "sum"),
-            ).reset_index()
-            season_scores["points_differential"] = season_scores["season_points"] - season_scores["points_against"]
-            season_scores = season_scores.sort_values(
-                "season_points", ascending=pr_ascending
-            ).head(pr_top_n).reset_index(drop=True)
-            season_scores.insert(0, "Rank", range(1, len(season_scores) + 1))
-            season_scores = season_scores.round(2).rename(columns={
-                "season_points": "Season Points",
-                "manager_name": "Owner",
-                "year": "Year",
-                "points_against": "Points Against",
-                "points_differential": "Points Differential",
-            })
-            season_scores = comma_format(season_scores, ["Season Points", "Points Against", "Points Differential"])
-            st.dataframe(
-                season_scores[["Rank", "Season Points", "Owner", "Year", "Points Against", "Points Differential"]],
-                use_container_width=True, hide_index=True,
-            )
+        # --- Points Per Game ---
+        per_game = pr_filtered.groupby("manager_name").agg(
+            seasons_played=("year", "nunique"),
+            games_played=("year", "size"),
+            points_for=("team_score", "sum"),
+            points_against=("opponent_score", "sum"),
+        ).reset_index()
+        per_game["points_for"] = per_game["points_for"] / per_game["games_played"]
+        per_game["points_against"] = per_game["points_against"] / per_game["games_played"]
+        per_game["points_differential"] = per_game["points_for"] - per_game["points_against"]
+        per_game = per_game.sort_values("points_for", ascending=pr_ascending).head(pr_top_n).reset_index(drop=True)
+        per_game.insert(0, "Rank", range(1, len(per_game) + 1))
+        per_game = per_game.round(2).rename(columns={
+            "manager_name": "Owner",
+            "seasons_played": "Seasons Played",
+            "points_for": "Points For",
+            "points_against": "Points Against",
+            "points_differential": "Margin",
+        })
+        per_game = comma_format(per_game, ["Points For", "Points Against", "Margin"])
 
-            # --- Highest Single Game Score ---
-            st.markdown("**Highest Single Game Score**")
-            game_scores = pr_filtered.copy()
-            game_scores["points_differential"] = game_scores["team_score"] - game_scores["opponent_score"]
-            game_scores = game_scores.sort_values(
-                "team_score", ascending=pr_ascending
-            ).head(pr_top_n).reset_index(drop=True)
-            game_scores.insert(0, "Rank", range(1, len(game_scores) + 1))
-            game_scores = game_scores.round(2).rename(columns={
-                "team_score": "Points",
-                "manager_name": "Owner",
-                "opponent_name": "Opponent",
-                "year": "Year",
-                "week": "Week",
-                "is_playoff": "Playoff Game?",
-                "opponent_score": "Points Against",
-                "points_differential": "Points Differential",
-            })
-            game_scores = comma_format(game_scores, ["Points", "Points Against", "Points Differential"])
-            st.dataframe(
-                game_scores[[
-                    "Rank", "Points", "Owner", "Opponent", "Year", "Week",
-                    "Playoff Game?", "Points Against", "Points Differential",
-                ]],
-                use_container_width=True, hide_index=True,
-            )
+        # --- Points Per Game Against ---
+        per_game_against = pr_filtered.groupby("manager_name").agg(
+            seasons_played=("year", "nunique"),
+            games_played=("year", "size"),
+            points_for=("team_score", "sum"),
+            points_against=("opponent_score", "sum"),
+        ).reset_index()
+        per_game_against["points_for"] = per_game_against["points_for"] / per_game_against["games_played"]
+        per_game_against["points_against"] = per_game_against["points_against"] / per_game_against["games_played"]
+        per_game_against["points_differential"] = per_game_against["points_for"] - per_game_against["points_against"]
+        per_game_against = per_game_against.sort_values(
+            "points_against", ascending=pr_ascending
+        ).head(pr_top_n).reset_index(drop=True)
+        per_game_against.insert(0, "Rank", range(1, len(per_game_against) + 1))
+        per_game_against = per_game_against.round(2).rename(columns={
+            "manager_name": "Owner",
+            "seasons_played": "Seasons Played",
+            "points_for": "Points For",
+            "points_against": "Points Against",
+            "points_differential": "Margin",
+        })
+        per_game_against = comma_format(per_game_against, ["Points For", "Points Against", "Margin"])
 
-            # --- Highest Point Margins ---
-            st.markdown("**Highest Point Margins**")
-            margins = pr_filtered.copy()
-            margins["margin"] = margins["team_score"] - margins["opponent_score"]
-            margins = margins.sort_values("margin", ascending=pr_ascending).head(pr_top_n).reset_index(drop=True)
-            margins.insert(0, "Rank", range(1, len(margins) + 1))
-            margins = margins.round(2).rename(columns={
+        # --- Highest Single Season Scores ---
+        season_scores = pr_filtered.groupby(["manager_name", "year"]).agg(
+            season_points=("team_score", "sum"),
+            points_against=("opponent_score", "sum"),
+        ).reset_index()
+        season_scores["points_differential"] = season_scores["season_points"] - season_scores["points_against"]
+        season_scores = season_scores.sort_values(
+            "season_points", ascending=pr_ascending
+        ).head(pr_top_n).reset_index(drop=True)
+        season_scores.insert(0, "Rank", range(1, len(season_scores) + 1))
+        season_scores = season_scores.round(2).rename(columns={
+            "season_points": "Season Points",
+            "manager_name": "Owner",
+            "year": "Year",
+            "points_against": "Points Against",
+            "points_differential": "Margin",
+        })
+        season_scores = comma_format(season_scores, ["Season Points", "Points Against", "Margin"])
+
+        # --- Single Season Points Against ---
+        season_scores_against = pr_filtered.groupby(["manager_name", "year"]).agg(
+            season_points=("team_score", "sum"),
+            points_against=("opponent_score", "sum"),
+        ).reset_index()
+        season_scores_against["points_differential"] = (
+            season_scores_against["season_points"] - season_scores_against["points_against"]
+        )
+        season_scores_against = season_scores_against.sort_values(
+            "points_against", ascending=pr_ascending
+        ).head(pr_top_n).reset_index(drop=True)
+        season_scores_against.insert(0, "Rank", range(1, len(season_scores_against) + 1))
+        season_scores_against = season_scores_against.round(2).rename(columns={
+            "points_against": "Season Points Against",
+            "manager_name": "Owner",
+            "year": "Year",
+            "season_points": "Season Points",
+            "points_differential": "Margin",
+        })
+        season_scores_against = comma_format(
+            season_scores_against, ["Season Points Against", "Season Points", "Margin"]
+        )
+
+        # --- Highest Single Game Score ---
+        game_scores = pr_filtered.copy()
+        game_scores["points_differential"] = game_scores["team_score"] - game_scores["opponent_score"]
+        game_scores = game_scores.sort_values(
+            "team_score", ascending=pr_ascending
+        ).head(pr_top_n).reset_index(drop=True)
+        game_scores.insert(0, "Rank", range(1, len(game_scores) + 1))
+        game_scores = game_scores.round(2).rename(columns={
+            "team_score": "Points",
+            "manager_name": "Owner",
+            "opponent_name": "Opponent",
+            "year": "Year",
+            "week": "Week",
+            "is_playoff": "Playoff Game?",
+            "opponent_score": "Points Against",
+            "points_differential": "Margin",
+        })
+        game_scores = comma_format(game_scores, ["Points", "Points Against", "Margin"])
+
+        # --- Single Game Score Combined ---
+        # Each physical game has a mirrored row (one per team's perspective)
+        # with an identical combined total -- collapsed down to a single row
+        # per physical game, same as Tie Games.
+        combined_scores = pr_filtered.copy()
+        combined_scores["combined_points"] = combined_scores["team_score"] + combined_scores["opponent_score"]
+        combined_scores["_pair_key"] = combined_scores.apply(
+            lambda r: tuple(sorted([r["manager_name"], r["opponent_name"]])), axis=1
+        )
+        combined_scores = combined_scores.drop_duplicates(
+            subset=["year", "week", "_pair_key"]
+        ).drop(columns="_pair_key")
+        combined_scores = combined_scores.sort_values(
+            "combined_points", ascending=pr_ascending
+        ).head(pr_top_n).reset_index(drop=True)
+        combined_scores.insert(0, "Rank", range(1, len(combined_scores) + 1))
+        combined_scores = combined_scores.round(2).rename(columns={
+            "combined_points": "Points",
+            "manager_name": "Owner",
+            "opponent_name": "Opponent",
+            "year": "Year",
+            "week": "Week",
+            "is_playoff": "Playoff Game?",
+        })
+        combined_scores = comma_format(combined_scores, ["Points"])
+
+        # --- Points In a Loss ---
+        loss_scores = pr_filtered[pr_filtered["team_score"] < pr_filtered["opponent_score"]].copy()
+        loss_scores["points_differential"] = loss_scores["team_score"] - loss_scores["opponent_score"]
+        loss_scores = loss_scores.sort_values(
+            "team_score", ascending=pr_ascending
+        ).head(pr_top_n).reset_index(drop=True)
+        loss_scores.insert(0, "Rank", range(1, len(loss_scores) + 1))
+        loss_scores = loss_scores.round(2).rename(columns={
+            "team_score": "Points",
+            "manager_name": "Owner",
+            "opponent_name": "Opponent",
+            "year": "Year",
+            "week": "Week",
+            "is_playoff": "Playoff Game?",
+            "opponent_score": "Points Against",
+            "points_differential": "Margin",
+        })
+        loss_scores = comma_format(loss_scores, ["Points", "Points Against", "Margin"])
+
+        # --- Points In a Win ---
+        win_scores = pr_filtered[pr_filtered["team_score"] > pr_filtered["opponent_score"]].copy()
+        win_scores["points_differential"] = win_scores["team_score"] - win_scores["opponent_score"]
+        win_scores = win_scores.sort_values(
+            "team_score", ascending=pr_ascending
+        ).head(pr_top_n).reset_index(drop=True)
+        win_scores.insert(0, "Rank", range(1, len(win_scores) + 1))
+        win_scores = win_scores.round(2).rename(columns={
+            "team_score": "Points",
+            "manager_name": "Owner",
+            "opponent_name": "Opponent",
+            "year": "Year",
+            "week": "Week",
+            "is_playoff": "Playoff Game?",
+            "opponent_score": "Points Against",
+            "points_differential": "Margin",
+        })
+        win_scores = comma_format(win_scores, ["Points", "Points Against", "Margin"])
+
+        # --- Highest Point Margins ---
+        margins = pr_filtered.copy()
+        margins["margin"] = margins["team_score"] - margins["opponent_score"]
+        margins = margins[margins["margin"] > 0]
+        margins = margins.sort_values("margin", ascending=pr_ascending).head(pr_top_n).reset_index(drop=True)
+        margins.insert(0, "Rank", range(1, len(margins) + 1))
+        margins = margins.round(2).rename(columns={
+            "margin": "Margin",
+            "manager_name": "Owner",
+            "opponent_name": "Opponent",
+            "year": "Year",
+            "week": "Week",
+            "is_playoff": "Playoff Game?",
+            "team_score": "Points For",
+            "opponent_score": "Points Against",
+        })
+        margins = comma_format(margins, ["Margin", "Points For", "Points Against"])
+
+        # --- Tie Games ---
+        # A copy of Point Margin, but agnostic of the filters above (uses
+        # games_detail_df directly, not pr_filtered), no Rank column, and
+        # restricted to margin == 0. Each tied game has a mirrored row (one
+        # per team's perspective, both with identical scores) -- collapsed
+        # down to a single row per physical game.
+        tie_games = games_detail_df.copy()
+        tie_games["margin"] = tie_games["team_score"] - tie_games["opponent_score"]
+        tie_games = tie_games[tie_games["margin"] == 0]
+        tie_games["_pair_key"] = tie_games.apply(
+            lambda r: tuple(sorted([r["manager_name"], r["opponent_name"]])), axis=1
+        )
+        tie_games = tie_games.drop_duplicates(subset=["year", "week", "_pair_key"]).drop(columns="_pair_key")
+        tie_games = tie_games.sort_values(["year", "week"]).reset_index(drop=True)
+        if not tie_games.empty:
+            tie_games = tie_games.round(2).rename(columns={
                 "margin": "Margin",
                 "manager_name": "Owner",
                 "opponent_name": "Opponent",
@@ -870,14 +1030,87 @@ with tab_point_records:
                 "team_score": "Points For",
                 "opponent_score": "Points Against",
             })
-            margins = comma_format(margins, ["Margin", "Points For", "Points Against"])
-            st.dataframe(
-                margins[[
-                    "Rank", "Margin", "Owner", "Opponent", "Year", "Week",
-                    "Playoff Game?", "Points For", "Points Against",
-                ]],
-                use_container_width=True, hide_index=True,
-            )
+            tie_games = comma_format(tie_games, ["Margin", "Points For", "Points Against"])
+
+        def show_table(container, title, df, columns, empty_message):
+            with container:
+                st.markdown(f"**{title}**")
+                if df.empty:
+                    st.info(empty_message)
+                else:
+                    render_centered_table(df[columns])
+
+        row1_col1, row1_col2 = st.columns(2)
+        show_table(
+            row1_col1, "Points All Time", all_time,
+            ["Rank", "Owner", "Seasons Played", "Points For", "Points Against", "Margin"],
+            "No games match the selected filters.",
+        )
+        show_table(
+            row1_col2, "Points Against All Time", against_all_time,
+            ["Rank", "Owner", "Seasons Played", "Points Against", "Points For", "Margin"],
+            "No games match the selected filters.",
+        )
+
+        row2_col1, row2_col2 = st.columns(2)
+        show_table(
+            row2_col1, "Points Per Game", per_game,
+            ["Rank", "Owner", "Seasons Played", "Points For", "Points Against", "Margin"],
+            "No games match the selected filters.",
+        )
+        show_table(
+            row2_col2, "Points Per Game Against", per_game_against,
+            ["Rank", "Owner", "Seasons Played", "Points Against", "Points For", "Margin"],
+            "No games match the selected filters.",
+        )
+
+        row3_col1, row3_col2 = st.columns(2)
+        show_table(
+            row3_col1, "Single Season Points", season_scores,
+            ["Rank", "Season Points", "Owner", "Year", "Points Against", "Margin"],
+            "No games match the selected filters.",
+        )
+        show_table(
+            row3_col2, "Single Season Points Against", season_scores_against,
+            ["Rank", "Season Points Against", "Owner", "Year", "Season Points", "Margin"],
+            "No games match the selected filters.",
+        )
+
+        row4_col1, row4_col2 = st.columns(2)
+        show_table(
+            row4_col1, "Single Game Points - Team", game_scores,
+            ["Rank", "Points", "Owner", "Opponent", "Year", "Week", "Playoff Game?", "Points Against", "Margin"],
+            "No games match the selected filters.",
+        )
+        show_table(
+            row4_col2, "Single Games Points Combined", combined_scores,
+            ["Rank", "Points", "Owner", "Opponent", "Year", "Week", "Playoff Game?"],
+            "No games match the selected filters.",
+        )
+
+        row5_col1, row5_col2 = st.columns(2)
+        show_table(
+            row5_col1, "Points In a Loss", loss_scores,
+            ["Rank", "Points", "Owner", "Opponent", "Year", "Week", "Playoff Game?", "Points Against", "Margin"],
+            "No games match the selected filters.",
+        )
+        show_table(
+            row5_col2, "Points In a Win", win_scores,
+            ["Rank", "Points", "Owner", "Opponent", "Year", "Week", "Playoff Game?", "Points Against", "Margin"],
+            "No games match the selected filters.",
+        )
+
+        row6_col1, row6_col2 = st.columns(2)
+        show_table(
+            row6_col1, "Point Margin", margins,
+            ["Rank", "Margin", "Owner", "Opponent", "Year", "Week", "Playoff Game?", "Points For", "Points Against"],
+            "No games match the selected filters.",
+        )
+        show_table(
+            row6_col2, "Tie Games", tie_games,
+            ["Margin", "Owner", "Opponent", "Year", "Week", "Playoff Game?", "Points For", "Points Against"],
+            "No tie games found.",
+        )
 
 # --- TAB: Wins and Losses ---
 with tab_wins_losses:
