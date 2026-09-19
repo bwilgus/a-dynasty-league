@@ -183,6 +183,8 @@ def load_all_games_detail():
             g.year,
             g.week,
             g.is_playoff,
+            g.team_id,
+            g.opponent_team_id,
             COALESCE(o.real_name, t.owner) AS manager_name,
             COALESCE(oo.real_name, ot.owner) AS opponent_name,
             g.team_score,
@@ -289,7 +291,7 @@ def load_live_games_detail():
     games = live["games"]
     teams = live["teams"]
     columns = [
-        "year", "week", "is_playoff", "manager_name", "opponent_name",
+        "year", "week", "is_playoff", "team_id", "opponent_team_id", "manager_name", "opponent_name",
         "team_score", "opponent_score", "modern_era",
     ]
     if games.empty or teams.empty:
@@ -327,6 +329,10 @@ st.markdown(
     table.standings-table th, table.standings-table td {
         padding: 8px 12px;
         border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+    }
+    table.standings-table th {
+        background-color: rgba(255, 255, 255, 0.08);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.3);
     }
     table.record-table {
         border: 2px solid rgba(128, 128, 128, 0.75);
@@ -1404,101 +1410,608 @@ with tab_wins_losses:
             "No games match the selected filters.",
         )
 
-# --- TAB: Head-to-Head Records ---
-with tab_h2h:
-    hh_games_detail_df = load_all_games_detail()
+def load_combined_games_detail():
+    """load_all_games_detail() (historical) concatenated with
+    load_live_games_detail() (the current in-progress season, if any),
+    shown as a warning rather than a crash if the live fetch fails.
+    """
+    combined = load_all_games_detail()
     try:
-        hh_live_games_detail_df = load_live_games_detail()
-        if not hh_live_games_detail_df.empty:
-            hh_games_detail_df = pd.concat(
-                [hh_games_detail_df, hh_live_games_detail_df], ignore_index=True
-            )
+        live = load_live_games_detail()
+        if not live.empty:
+            combined = pd.concat([combined, live], ignore_index=True)
     except Exception as e:
         st.warning(f"Couldn't fetch live game data from Sleeper: {e}")
+    return combined
 
-    if hh_games_detail_df.empty:
-        st.info("No game records found in the database.")
+
+LINEUP_COLUMNS = ["player_name", "player_position", "player_slot_position", "player_score"]
+EFFICIENCY_COLUMNS = ["actual_score", "optimal_score", "efficiency_pct"]
+BENCH_SLOTS = {"BN", "BE", "IR", "TAXI"}
+
+# Standard starting-lineup slot order (QB, RB, RB, WR, WR, TE, FLEX, FLEX, K,
+# D/ST) -- ranked by normalized slot name; both RB/WR/FLEX starters share one
+# rank each and keep their relative (score-sorted) order via a stable sort.
+STARTER_SLOT_ORDER = ["QB", "RB", "WR", "TE", "FLEX", "K", "DEF"]
+STARTER_SLOT_ALIASES = {"D/ST": "DEF", "RB/WR/TE": "FLEX"}
+
+
+def starter_slot_rank(slot):
+    normalized = STARTER_SLOT_ALIASES.get(slot, slot)
+    try:
+        return STARTER_SLOT_ORDER.index(normalized)
+    except ValueError:
+        return len(STARTER_SLOT_ORDER)
+
+
+# Bench order: plain bench slots (either era's label) first, then taxi squad,
+# then IR last -- IR players are the least likely to have played that week.
+BENCH_SLOT_ORDER = ["BN", "BE", "TAXI", "IR"]
+
+
+def bench_slot_rank(slot):
+    try:
+        return BENCH_SLOT_ORDER.index(slot)
+    except ValueError:
+        return len(BENCH_SLOT_ORDER)
+
+
+@st.cache_data(ttl=600)
+def load_game_lineup(year, week, team_id):
+    """A single team's per-player lineup for one game, from the historical
+    DB. Empty for 2014-2016 (no lineup data exists for that era, see
+    CLAUDE.md) or for a game not yet ingested (e.g. the live season).
+    """
+    conn = get_connection()
+    query = """
+        SELECT player_name, player_position, player_slot_position, player_score
+        FROM lineups
+        WHERE year = ? AND week = ? AND team_id = ?
+        ORDER BY player_score DESC
+    """
+    df = pd.read_sql_query(query, conn, params=(year, week, team_id))
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=600)
+def load_game_efficiency(year, week, team_id):
+    """A single team's manager-efficiency row for one game, from the
+    historical DB. Empty before 2018 or for a not-yet-ingested game.
+    """
+    conn = get_connection()
+    query = """
+        SELECT actual_score, optimal_score, efficiency_pct
+        FROM manager_efficiency
+        WHERE year = ? AND week = ? AND team_id = ?
+    """
+    df = pd.read_sql_query(query, conn, params=(year, week, team_id))
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=300)
+def load_live_game_lineup(year, week, team_id):
+    """Live equivalent of load_game_lineup() for the current in-progress
+    Sleeper season -- empty if `year` isn't that season.
+    """
+    live = sleeper_live.get_live_season_data()
+    if live["year"] != year:
+        return pd.DataFrame(columns=LINEUP_COLUMNS)
+    lineups = live["lineups"]
+    filtered = lineups[(lineups["week"] == week) & (lineups["team_id"] == team_id)]
+    return filtered[LINEUP_COLUMNS].sort_values("player_score", ascending=False).reset_index(drop=True)
+
+
+@st.cache_data(ttl=300)
+def load_live_game_efficiency(year, week, team_id):
+    """Live equivalent of load_game_efficiency()."""
+    live = sleeper_live.get_live_season_data()
+    if live["year"] != year:
+        return pd.DataFrame(columns=EFFICIENCY_COLUMNS)
+    eff = live["manager_efficiency"]
+    filtered = eff[(eff["week"] == week) & (eff["team_id"] == team_id)]
+    return filtered[EFFICIENCY_COLUMNS].reset_index(drop=True)
+
+
+def load_combined_game_lineup(year, week, team_id):
+    df = load_game_lineup(year, week, team_id)
+    if df.empty:
+        try:
+            df = load_live_game_lineup(year, week, team_id)
+        except Exception:
+            pass
+    return df
+
+
+def load_combined_game_efficiency(year, week, team_id):
+    df = load_game_efficiency(year, week, team_id)
+    if df.empty:
+        try:
+            df = load_live_game_efficiency(year, week, team_id)
+        except Exception:
+            pass
+    return df
+
+
+# --- TAB: Head-to-Head Records ---
+with tab_h2h:
+    if st.session_state.get("hh_view") == "game_detail":
+        hh_gd_team1 = st.session_state.get("hh_detail_team1")
+        hh_gd_team2 = st.session_state.get("hh_detail_team2")
+        hh_gd_year = st.session_state.get("hh_game_year")
+        hh_gd_week = st.session_state.get("hh_game_week")
+        hh_gd_team1_id = st.session_state.get("hh_game_team1_id")
+        hh_gd_team2_id = st.session_state.get("hh_game_team2_id")
+
+        if st.button("← Back to Matchup", key="hh_game_detail_back_button"):
+            st.session_state["hh_view"] = "detail"
+            st.rerun()
+
+        st.markdown(
+            f"<h3 style='text-align:center'>{hh_gd_team1} vs {hh_gd_team2} — {hh_gd_year} Week {hh_gd_week}</h3>",
+            unsafe_allow_html=True,
+        )
+
+        if hh_gd_year is not None and hh_gd_year <= 2016:
+            st.info(
+                "No per-player lineup data exists for 2014-2016 (NFL.com era) -- "
+                "see CLAUDE.md's data-era notes."
+            )
+        else:
+            if hh_gd_year == 2017:
+                st.warning(
+                    "2017 lineup slot data is known to be corrupted (every row reads 'QB' "
+                    "regardless of actual slot), so the starters/bench split below may not "
+                    "be accurate for this game."
+                )
+
+            def hh_render_team_lineup(container, team_name, team_id):
+                with container:
+                    st.markdown(f"<div style='text-align:center;'><strong>{team_name}</strong></div>", unsafe_allow_html=True)
+                    lineup = load_combined_game_lineup(hh_gd_year, hh_gd_week, team_id)
+                    efficiency = load_combined_game_efficiency(hh_gd_year, hh_gd_week, team_id)
+
+                    if not efficiency.empty:
+                        eff_row = efficiency.iloc[0]
+                        st.markdown(
+                            "<div style='text-align:center; font-size:0.85rem; opacity:0.7;'>"
+                            f"Actual: {eff_row['actual_score']:.2f} · "
+                            f"Optimal: {eff_row['optimal_score']:.2f} · "
+                            f"Efficiency: {eff_row['efficiency_pct']:.2f}%"
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    if lineup.empty:
+                        st.info("No lineup data available for this game.")
+                        return
+
+                    starters = lineup[~lineup["player_slot_position"].isin(BENCH_SLOTS)].copy()
+                    starters["_slot_rank"] = starters["player_slot_position"].map(starter_slot_rank)
+                    starters = starters.sort_values("_slot_rank", kind="mergesort").drop(columns="_slot_rank")
+                    bench = lineup[lineup["player_slot_position"].isin(BENCH_SLOTS)].copy()
+                    bench["_slot_rank"] = bench["player_slot_position"].map(bench_slot_rank)
+                    bench = bench.sort_values("_slot_rank", kind="mergesort").drop(columns="_slot_rank")
+
+                    for section_title, section_df in [("Starters", starters), ("Bench", bench)]:
+                        st.markdown(f"<div style='text-align:center;'><em>{section_title}</em></div>", unsafe_allow_html=True)
+                        if section_df.empty:
+                            st.caption("None")
+                            continue
+                        display_df = section_df.rename(columns={
+                            "player_name": "Player",
+                            "player_position": "Position",
+                            "player_slot_position": "Slot",
+                            "player_score": "Points",
+                        })
+                        display_df = comma_format(display_df, ["Points"])
+                        render_centered_table(display_df[["Player", "Position", "Slot", "Points"]])
+
+            hh_gd_col1, hh_gd_col2 = st.columns(2)
+            hh_render_team_lineup(hh_gd_col1, hh_gd_team1, hh_gd_team1_id)
+            hh_render_team_lineup(hh_gd_col2, hh_gd_team2, hh_gd_team2_id)
+    elif st.session_state.get("hh_view") == "detail":
+        hh_detail_team1 = st.session_state.get("hh_detail_team1")
+        hh_detail_team2 = st.session_state.get("hh_detail_team2")
+
+        if st.button("← Back to Head-to-Head Records", key="hh_back_button"):
+            st.session_state["hh_view"] = "list"
+            st.rerun()
+
+        st.markdown(
+            f"<h3 style='text-align:center'>{hh_detail_team1} vs {hh_detail_team2}</h3>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            <div style="text-align:center; margin-bottom: 0.5rem;">
+                <a href="#hh-game-log" style="
+                    display:inline-block; padding:0.375rem 0.9rem;
+                    border:1px solid rgba(128,128,128,0.4); border-radius:0.5rem;
+                    text-decoration:none; color:inherit; font-size:0.9rem;
+                ">See Game Log ↓</a>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        hh_matchup = load_combined_games_detail()
+        hh_matchup = hh_matchup[
+            (hh_matchup["manager_name"] == hh_detail_team1)
+            & (hh_matchup["opponent_name"] == hh_detail_team2)
+        ].sort_values(["year", "week"]).reset_index(drop=True)
+
+        if hh_matchup.empty:
+            st.info(f"{hh_detail_team1} and {hh_detail_team2} have never played each other.")
+        else:
+            # Team1/Team2 identity colors, reused across every chart on this
+            # page (validated categorical slots 1/2 -- see dataviz skill's
+            # palette.md; ties get a neutral chrome gray, not a hue).
+            HH_TEAM1_COLOR = "#2a78d6"
+            HH_TEAM2_COLOR = "#eb6834"
+            HH_TIE_COLOR = "#898781"
+            hh_bar_domain = [hh_detail_team1, "Ties", hh_detail_team2]
+            hh_bar_range = [HH_TEAM1_COLOR, HH_TIE_COLOR, HH_TEAM2_COLOR]
+
+            hh_matchup["result"] = np.select(
+                [hh_matchup["team_score"] > hh_matchup["opponent_score"],
+                 hh_matchup["team_score"] < hh_matchup["opponent_score"]],
+                ["team1", "team2"],
+                default="tie",
+            )
+            hh_matchup["margin"] = hh_matchup["team_score"] - hh_matchup["opponent_score"]
+
+            hh_d_wins = int((hh_matchup["result"] == "team1").sum())
+            hh_d_losses = int((hh_matchup["result"] == "team2").sum())
+            hh_d_ties = int((hh_matchup["result"] == "tie").sum())
+
+            def hh_metric_card(
+                container, label, value, subtitle=None,
+                label_size="1.1rem", value_size="1.5rem", label_below=False,
+                value_subtitle=None,
+            ):
+                subtitle_html = (
+                    f'<div style="font-size:0.85rem; opacity:0.6; margin-top:2px;">{subtitle}</div>'
+                    if subtitle else ""
+                )
+                value_subtitle_html = (
+                    f'<div style="font-size:0.75rem; opacity:0.6;">{value_subtitle}</div>'
+                    if value_subtitle else ""
+                )
+                label_html = f'<div style="font-size:{label_size}; opacity:0.7;">{label}</div>'
+                value_html = f'<div style="font-size:{value_size}; font-weight:600;">{value}</div>'
+                stack = (
+                    [value_html, value_subtitle_html, label_html]
+                    if label_below else [label_html, value_html, value_subtitle_html]
+                )
+                container.markdown(
+                    f'<div style="text-align:center;">{stack[0]}{stack[1]}{stack[2]}{subtitle_html}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            hh_wtl_total = hh_d_wins + hh_d_ties + hh_d_losses
+
+            def hh_wtl_pct(count):
+                return f"{(count / hh_wtl_total * 100):.1f}%" if hh_wtl_total else "N/A"
+
+            _, hh_wtl_middle, _ = st.columns([1, 1, 1])
+            with hh_wtl_middle:
+                hh_wtl_col1, hh_wtl_col2, hh_wtl_col3 = st.columns(3, gap="small")
+                hh_metric_card(
+                    hh_wtl_col1, "Wins", str(hh_d_wins),
+                    label_size="1.3rem", value_size="2rem", label_below=True,
+                    value_subtitle=hh_wtl_pct(hh_d_wins),
+                )
+                hh_metric_card(
+                    hh_wtl_col2, "Ties", str(hh_d_ties),
+                    label_size="1.3rem", value_size="2rem", label_below=True,
+                    value_subtitle=hh_wtl_pct(hh_d_ties),
+                )
+                hh_metric_card(
+                    hh_wtl_col3, "Losses", str(hh_d_losses),
+                    label_size="1.3rem", value_size="2rem", label_below=True,
+                    value_subtitle=hh_wtl_pct(hh_d_losses),
+                )
+
+            st.divider()
+
+            # --- Win / Tie / Loss split bar ---
+            # A single plain-HTML flex row (names + bar together, one shared
+            # alignment context) -- an Altair/Vega-Lite chart was tried here
+            # first, but its rendered box is wrapped in Streamlit/vega-embed
+            # chrome whose exact height isn't controllable from Python, which
+            # made it impossible to reliably vertically align against the
+            # flanking name labels (several attempts drifted in the browser
+            # despite looking correct in isolated spec renders). Plain HTML
+            # sidesteps that entirely.
+            st.markdown(
+                f'<div style="display:flex; align-items:center; width:100%;">'
+                f'<div style="flex:0 0 auto; text-align:right; font-weight:600; '
+                f'padding-right:12px; white-space:nowrap;">{hh_detail_team1}</div>'
+                f'<div style="flex:1 1 auto; display:flex; height:32px; border-radius:4px; overflow:hidden;">'
+                f'<div style="flex:{hh_d_wins} 0 0; background:{HH_TEAM1_COLOR};" '
+                f'title="{hh_detail_team1}: {hh_d_wins}"></div>'
+                f'<div style="flex:{hh_d_ties} 0 0; background:{HH_TIE_COLOR};" '
+                f'title="Ties: {hh_d_ties}"></div>'
+                f'<div style="flex:{hh_d_losses} 0 0; background:{HH_TEAM2_COLOR};" '
+                f'title="{hh_detail_team2}: {hh_d_losses}"></div>'
+                f'</div>'
+                f'<div style="flex:0 0 auto; text-align:left; font-weight:600; '
+                f'padding-left:12px; white-space:nowrap;">{hh_detail_team2}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            # --- Current streak (shared streak-run computation) ---
+            hh_matchup["streak_id"] = (hh_matchup["result"] != hh_matchup["result"].shift()).cumsum()
+            hh_streaks = hh_matchup.groupby("streak_id").agg(
+                result=("result", "first"),
+                length=("result", "size"),
+                start_year=("year", "first"),
+                end_year=("year", "last"),
+            ).reset_index(drop=True)
+
+            hh_current = hh_streaks.iloc[-1]
+            if hh_current["result"] == "tie":
+                hh_current_label = "No Active Streak"
+                hh_current_value = "Last meeting was a tie"
+            else:
+                hh_current_owner = hh_detail_team1 if hh_current["result"] == "team1" else hh_detail_team2
+                hh_current_label = "Current Streak"
+                hh_current_value = f"{hh_current_owner} — {int(hh_current['length'])} Games"
+
+            hh_streak_col1, hh_streak_col2, hh_streak_col3 = st.columns([1, 2, 1])
+            hh_metric_card(hh_streak_col2, hh_current_label, hh_current_value)
+
+            st.divider()
+
+            # --- Per-game margin bar chart ---
+            hh_margins = hh_matchup.copy()
+            hh_margins["game_label"] = hh_margins["year"].astype(str) + " Wk " + hh_margins["week"].astype(str)
+            hh_margins["segment"] = hh_margins["result"].map({
+                "team1": hh_detail_team1, "team2": hh_detail_team2, "tie": "Ties",
+            })
+            hh_margin_bound = hh_margins["margin"].abs().max()
+            hh_margin_chart = alt.Chart(hh_margins).mark_bar(cornerRadius=3).encode(
+                x=alt.X(
+                    "game_label:N", title=None, sort=hh_margins["game_label"].tolist(),
+                    axis=alt.Axis(labels=False, ticks=False),
+                ),
+                y=alt.Y(
+                    "margin:Q", title="Margin",
+                    scale=alt.Scale(domain=[-hh_margin_bound, hh_margin_bound]),
+                ),
+                color=alt.Color(
+                    "segment:N",
+                    scale=alt.Scale(domain=hh_bar_domain, range=hh_bar_range),
+                    legend=alt.Legend(title=None),
+                ),
+                tooltip=[
+                    alt.Tooltip("game_label:N", title="Game"),
+                    alt.Tooltip("team_score:Q", title=f"{hh_detail_team1} Score", format=",.2f"),
+                    alt.Tooltip("opponent_score:Q", title=f"{hh_detail_team2} Score", format=",.2f"),
+                    alt.Tooltip("margin:Q", title="Margin", format=",.2f"),
+                ],
+            ).properties(height=350)
+            st.altair_chart(hh_margin_chart, use_container_width=True)
+
+            st.divider()
+
+            # --- Four highlight metric cards ---
+            hh_team1_wins = hh_matchup[hh_matchup["result"] == "team1"]
+            hh_team2_wins = hh_matchup[hh_matchup["result"] == "team2"]
+            hh_team1_streaks = hh_streaks[hh_streaks["result"] == "team1"]
+            hh_team2_streaks = hh_streaks[hh_streaks["result"] == "team2"]
+
+            def hh_streak_years(row):
+                start, end = int(row["start_year"]), int(row["end_year"])
+                return str(start) if start == end else f"{start}-{end}"
+
+            hh_card_col1, hh_card_col2, hh_card_col3, hh_card_col4 = st.columns(4)
+
+            if not hh_team1_wins.empty:
+                hh_best1 = hh_team1_wins.loc[hh_team1_wins["margin"].idxmax()]
+                hh_metric_card(
+                    hh_card_col1,
+                    f"Largest Margin of Victory — {hh_detail_team1}",
+                    f"{hh_best1['margin']:.2f}",
+                    f"{hh_best1['team_score']:.2f}-{hh_best1['opponent_score']:.2f} ({int(hh_best1['year'])})",
+                )
+            else:
+                hh_metric_card(hh_card_col1, f"Largest Margin of Victory — {hh_detail_team1}", "N/A")
+
+            if not hh_team1_streaks.empty:
+                hh_longest1 = hh_team1_streaks.loc[hh_team1_streaks["length"].idxmax()]
+                hh_metric_card(
+                    hh_card_col2,
+                    f"Longest Win Streak — {hh_detail_team1}",
+                    f"{int(hh_longest1['length'])} Games",
+                    hh_streak_years(hh_longest1),
+                )
+            else:
+                hh_metric_card(hh_card_col2, f"Longest Win Streak — {hh_detail_team1}", "N/A")
+
+            if not hh_team2_wins.empty:
+                hh_best2 = hh_team2_wins.loc[hh_team2_wins["margin"].idxmin()]
+                hh_metric_card(
+                    hh_card_col3,
+                    f"Largest Margin of Victory — {hh_detail_team2}",
+                    f"{-hh_best2['margin']:.2f}",
+                    f"{hh_best2['opponent_score']:.2f}-{hh_best2['team_score']:.2f} ({int(hh_best2['year'])})",
+                )
+            else:
+                hh_metric_card(hh_card_col3, f"Largest Margin of Victory — {hh_detail_team2}", "N/A")
+
+            if not hh_team2_streaks.empty:
+                hh_longest2 = hh_team2_streaks.loc[hh_team2_streaks["length"].idxmax()]
+                hh_metric_card(
+                    hh_card_col4,
+                    f"Longest Win Streak — {hh_detail_team2}",
+                    f"{int(hh_longest2['length'])} Games",
+                    hh_streak_years(hh_longest2),
+                )
+            else:
+                hh_metric_card(hh_card_col4, f"Longest Win Streak — {hh_detail_team2}", "N/A")
+
+            st.divider()
+
+            st.markdown('<div id="hh-game-log"></div>', unsafe_allow_html=True)
+            st.markdown("<div style='text-align:center;'><strong>Game Log</strong></div>", unsafe_allow_html=True)
+
+            hh_log_widths = [0.7, 0.7, 1.1, 1.3, 1.3, 0.8, 1.1]
+            hh_log_headers = [
+                "Year", "Week", "Playoff Game?",
+                f"{hh_detail_team1} Points", f"{hh_detail_team2} Points", "Result", "",
+            ]
+            with st.container(border=True):
+                for col, label in zip(st.columns(hh_log_widths), hh_log_headers):
+                    col.markdown(f"<div style='text-align:center; font-weight:600;'>{label}</div>", unsafe_allow_html=True)
+
+                hh_result_label = {"team1": "Win", "team2": "Loss", "tie": "Tie"}
+                for hh_row_idx, hh_row in hh_matchup.iterrows():
+                    row_cols = st.columns(hh_log_widths)
+                    row_cols[0].markdown(
+                        f"<div style='text-align:center;'>{int(hh_row['year'])}</div>", unsafe_allow_html=True
+                    )
+                    row_cols[1].markdown(
+                        f"<div style='text-align:center;'>{int(hh_row['week'])}</div>", unsafe_allow_html=True
+                    )
+                    row_cols[2].markdown(
+                        f"<div style='text-align:center;'>{'Yes' if hh_row['is_playoff'] else 'No'}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    row_cols[3].markdown(
+                        f"<div style='text-align:center;'>{hh_row['team_score']:,.2f}</div>", unsafe_allow_html=True
+                    )
+                    row_cols[4].markdown(
+                        f"<div style='text-align:center;'>{hh_row['opponent_score']:,.2f}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    row_cols[5].markdown(
+                        f"<div style='text-align:center;'>{hh_result_label[hh_row['result']]}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if row_cols[6].button(
+                        "Details", key=f"hh_game_detail_{hh_row_idx}_{hh_row['year']}_{hh_row['week']}",
+                        use_container_width=True,
+                    ):
+                        st.session_state["hh_view"] = "game_detail"
+                        st.session_state["hh_game_year"] = int(hh_row["year"])
+                        st.session_state["hh_game_week"] = int(hh_row["week"])
+                        st.session_state["hh_game_team1_id"] = int(hh_row["team_id"])
+                        st.session_state["hh_game_team2_id"] = int(hh_row["opponent_team_id"])
+                        st.rerun()
     else:
-        hh_col1, hh_col2, hh_col3, hh_col4 = st.columns(4)
-        hh_season_type = hh_col1.selectbox(
-            "Season Type", ["All", "Regular Season", "Playoff"], key="hh_season_type"
+        # Reserves the layout slot for the filters/tables below, so it stays
+        # visually above the Team 1 / Team 2 picker, but is only filled in
+        # (with its slower, live-data-fetching content) after the picker's
+        # Go button is handled -- that keeps the "same team" toast instant
+        # on click instead of waiting behind that fetch on every rerun.
+        hh_filters_and_tables = st.container()
+
+        # --- Team 1 / Team 2 head-to-head lookup ---
+        st.markdown(
+            "<h3 style='text-align:center'>Head-to-Head Search</h3>", unsafe_allow_html=True
         )
-        hh_modern_era = hh_col2.selectbox(
-            "Modern Era", ["All", "True", "False"], key="hh_modern_era"
+        hh_owner_options = sorted(load_all_games_detail()["manager_name"].unique())
+        hh_pick_col1, hh_pick_col2, hh_pick_col3 = st.columns([2, 2, 1])
+        hh_team1_choice = hh_pick_col1.selectbox("Team 1", hh_owner_options, key="hh_team1_choice")
+        hh_team2_choice = hh_pick_col2.selectbox("Team 2", hh_owner_options, key="hh_team2_choice")
+        hh_pick_col3.markdown(
+            "<div style='height: 28px'></div>", unsafe_allow_html=True
         )
-        hh_all_years = sorted(hh_games_detail_df["year"].unique())
-        hh_seasons = hh_col3.multiselect(
-            "Seasons", hh_all_years, default=[], placeholder="All seasons", key="hh_seasons",
-        )
-        hh_min_games = hh_col4.number_input(
-            "Minimum Games", min_value=0, value=0, step=1, key="hh_min_games",
-        )
+        if hh_pick_col3.button("Go", key="hh_go_button", use_container_width=True):
+            if hh_team1_choice == hh_team2_choice:
+                st.toast("Please choose two different teams.", icon="⚠️")
+            else:
+                st.session_state["hh_view"] = "detail"
+                st.session_state["hh_detail_team1"] = hh_team1_choice
+                st.session_state["hh_detail_team2"] = hh_team2_choice
+                st.rerun()
 
-        hh_filtered = hh_games_detail_df.copy()
-        if hh_seasons:
-            hh_filtered = hh_filtered[hh_filtered["year"].isin(hh_seasons)]
-        if hh_season_type == "Regular Season":
-            hh_filtered = hh_filtered[~hh_filtered["is_playoff"]]
-        elif hh_season_type == "Playoff":
-            hh_filtered = hh_filtered[hh_filtered["is_playoff"]]
-        if hh_modern_era != "All":
-            hh_filtered = hh_filtered[hh_filtered["modern_era"] == (hh_modern_era == "True")]
+        with hh_filters_and_tables:
+            hh_games_detail_df = load_combined_games_detail()
 
-        st.divider()
+            if hh_games_detail_df.empty:
+                st.info("No game records found in the database.")
+            else:
+                hh_col1, hh_col2, hh_col3, hh_col4 = st.columns(4)
+                hh_season_type = hh_col1.selectbox(
+                    "Season Type", ["All", "Regular Season", "Playoff"], key="hh_season_type"
+                )
+                hh_modern_era = hh_col2.selectbox(
+                    "Modern Era", ["All", "True", "False"], key="hh_modern_era"
+                )
+                hh_all_years = sorted(hh_games_detail_df["year"].unique())
+                hh_seasons = hh_col3.multiselect(
+                    "Seasons", hh_all_years, default=[], placeholder="All seasons", key="hh_seasons",
+                )
+                hh_min_games = hh_col4.number_input(
+                    "Minimum Games", min_value=0, value=0, step=1, key="hh_min_games",
+                )
 
-        # --- Wins Against an Opponent / Winning Percentage ---
-        HH_TOP_N = 10
+                hh_filtered = hh_games_detail_df.copy()
+                if hh_seasons:
+                    hh_filtered = hh_filtered[hh_filtered["year"].isin(hh_seasons)]
+                if hh_season_type == "Regular Season":
+                    hh_filtered = hh_filtered[~hh_filtered["is_playoff"]]
+                elif hh_season_type == "Playoff":
+                    hh_filtered = hh_filtered[hh_filtered["is_playoff"]]
+                if hh_modern_era != "All":
+                    hh_filtered = hh_filtered[hh_filtered["modern_era"] == (hh_modern_era == "True")]
 
-        hh_pairs = hh_filtered.copy()
-        hh_pairs["is_win"] = hh_pairs["team_score"] > hh_pairs["opponent_score"]
-        hh_pairs["is_loss"] = hh_pairs["team_score"] < hh_pairs["opponent_score"]
+                st.divider()
 
-        hh_summary = hh_pairs.groupby(["manager_name", "opponent_name"]).agg(
-            games=("year", "size"),
-            wins=("is_win", "sum"),
-            losses=("is_loss", "sum"),
-        ).reset_index()
-        hh_summary["win_pct"] = (hh_summary["wins"] / hh_summary["games"]) * 100
-        if hh_min_games > 0:
-            hh_summary = hh_summary[hh_summary["games"] >= hh_min_games]
+                # --- Wins Against an Opponent / Winning Percentage ---
+                HH_TOP_N = 10
 
-        hh_wins = hh_summary.sort_values("wins", ascending=False).head(HH_TOP_N).reset_index(drop=True)
-        hh_wins.insert(0, "Rank", range(1, len(hh_wins) + 1))
-        hh_wins["Winning Percentage"] = hh_wins["win_pct"].map("{:.2f}%".format)
-        hh_wins = hh_wins.rename(columns={
-            "wins": "Wins",
-            "losses": "Losses",
-            "manager_name": "Owner",
-            "opponent_name": "Opponent",
-        })
+                hh_pairs = hh_filtered.copy()
+                hh_pairs["is_win"] = hh_pairs["team_score"] > hh_pairs["opponent_score"]
+                hh_pairs["is_loss"] = hh_pairs["team_score"] < hh_pairs["opponent_score"]
 
-        hh_win_pct = hh_summary.sort_values(
-            "win_pct", ascending=False
-        ).head(HH_TOP_N).reset_index(drop=True)
-        hh_win_pct.insert(0, "Rank", range(1, len(hh_win_pct) + 1))
-        hh_win_pct["Winning Percentage"] = hh_win_pct["win_pct"].map("{:.2f}%".format)
-        hh_win_pct = hh_win_pct.rename(columns={
-            "manager_name": "Owner",
-            "opponent_name": "Opponent",
-            "wins": "Wins",
-            "losses": "Losses",
-        })
+                hh_summary = hh_pairs.groupby(["manager_name", "opponent_name"]).agg(
+                    games=("year", "size"),
+                    wins=("is_win", "sum"),
+                    losses=("is_loss", "sum"),
+                ).reset_index()
+                hh_summary["win_pct"] = (hh_summary["wins"] / hh_summary["games"]) * 100
+                if hh_min_games > 0:
+                    hh_summary = hh_summary[hh_summary["games"] >= hh_min_games]
 
-        hh_table_col1, hh_table_col2 = st.columns(2)
-        show_table(
-            hh_table_col1, "Wins Against an Opponent", hh_wins,
-            ["Rank", "Wins", "Losses", "Owner", "Opponent", "Winning Percentage"],
-            "No games match the selected filters.",
-        )
-        show_table(
-            hh_table_col2, "Winning Percentage", hh_win_pct,
-            ["Rank", "Winning Percentage", "Owner", "Opponent", "Wins", "Losses"],
-            "No games match the selected filters.",
-        )
+                hh_wins = hh_summary.sort_values("wins", ascending=False).head(HH_TOP_N).reset_index(drop=True)
+                hh_wins.insert(0, "Rank", range(1, len(hh_wins) + 1))
+                hh_wins["Winning Percentage"] = hh_wins["win_pct"].map("{:.2f}%".format)
+                hh_wins = hh_wins.rename(columns={
+                    "wins": "Wins",
+                    "losses": "Losses",
+                    "manager_name": "Owner",
+                    "opponent_name": "Opponent",
+                })
 
-        st.divider()
+                hh_win_pct = hh_summary.sort_values(
+                    "win_pct", ascending=False
+                ).head(HH_TOP_N).reset_index(drop=True)
+                hh_win_pct.insert(0, "Rank", range(1, len(hh_win_pct) + 1))
+                hh_win_pct["Winning Percentage"] = hh_win_pct["win_pct"].map("{:.2f}%".format)
+                hh_win_pct = hh_win_pct.rename(columns={
+                    "manager_name": "Owner",
+                    "opponent_name": "Opponent",
+                    "wins": "Wins",
+                    "losses": "Losses",
+                })
 
-        st.info("Coming soon.")
+                hh_table_col1, hh_table_col2 = st.columns(2)
+                show_table(
+                    hh_table_col1, "Wins Against an Opponent", hh_wins,
+                    ["Rank", "Wins", "Losses", "Owner", "Opponent", "Winning Percentage"],
+                    "No games match the selected filters.",
+                )
+                show_table(
+                    hh_table_col2, "Winning Percentage Against an Opponent", hh_win_pct,
+                    ["Rank", "Winning Percentage", "Owner", "Opponent", "Wins", "Losses"],
+                    "No games match the selected filters.",
+                )
 
 # --- TAB: Draft History ---
 with tab_draft:
