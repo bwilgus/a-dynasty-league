@@ -579,7 +579,7 @@ with tab_standings:
                             domain=["Points Per Game", "Points Per Game Against"],
                             range=["#0072B2", "#E69F00"],
                         ),
-                        legend=alt.Legend(title=None),
+                        legend=alt.Legend(title=None, orient="top", direction="horizontal"),
                     ),
                     tooltip=[
                         alt.Tooltip("manager_name:N", title="Owner"),
@@ -608,7 +608,7 @@ with tab_standings:
                             domain=["Win", "Loss", "Tie"],
                             range=["#2a9147", "#bf2929", "#a6a6a6"],
                         ),
-                        legend=alt.Legend(title=None),
+                        legend=alt.Legend(title=None, orient="top", direction="horizontal"),
                     ),
                     tooltip=[
                         alt.Tooltip("opponent_name:N", title="Opponent"),
@@ -649,7 +649,7 @@ with tab_standings:
                 extreme_color = alt.Color(
                     "kind:N",
                     scale=alt.Scale(domain=["High", "Low"], range=["#2a9147", "#bf2929"]),
-                    legend=alt.Legend(title=None),
+                    legend=alt.Legend(title=None, orient="top", direction="horizontal"),
                 )
 
                 extreme_points = alt.Chart(extremes).mark_point(filled=True, size=70).encode(
@@ -717,7 +717,7 @@ with tab_standings:
                             domain=["Winning", "Losing", "Even"],
                             range=["#2a9147", "#bf2929", "#ffffff"],
                         ),
-                        legend=alt.Legend(title=None),
+                        legend=alt.Legend(title=None, orient="top", direction="horizontal"),
                     ),
                     tooltip=[
                         alt.Tooltip("manager_name:N", title="Owner"),
