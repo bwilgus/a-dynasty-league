@@ -337,6 +337,63 @@ st.markdown(
     table.record-table {
         border: 2px solid rgba(128, 128, 128, 0.75);
     }
+    /* Head-to-Head Game Log: st.columns() stacks its columns vertically
+       below Streamlit's ~640px mobile breakpoint, which is fine for
+       single-value layouts but turns this 8-column table into an
+       unreadable list. These rules (scoped via a marker div placed right
+       before each st.columns() call -- see hh-log-row in app.py; its
+       stElementContainer sibling is the stLayoutWrapper holding that
+       row's stHorizontalBlock) force the row back into a single
+       non-wrapping flex line with fixed minimum column widths, and let
+       the surrounding container (targeted by the st-key- class Streamlit
+       assigns from st.container(key=...)) scroll horizontally instead --
+       matching how the other tables in this app (raw HTML wrapped in a
+       div with overflow-x: auto) already behave on mobile. */
+    div[data-testid="stElementContainer"]:has(> div[data-testid="stMarkdown"] div.hh-log-row)
+        + div[data-testid="stLayoutWrapper"] div[data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap !important;
+        flex-direction: row !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div[data-testid="stMarkdown"] div.hh-log-row)
+        + div[data-testid="stLayoutWrapper"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+        flex-shrink: 0 !important;
+        width: auto !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div[data-testid="stMarkdown"] div.hh-log-row)
+        + div[data-testid="stLayoutWrapper"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:nth-child(1) {
+        flex: 0.9 0 110px !important; min-width: 110px !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div[data-testid="stMarkdown"] div.hh-log-row)
+        + div[data-testid="stLayoutWrapper"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:nth-child(2) {
+        flex: 0.7 0 70px !important; min-width: 70px !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div[data-testid="stMarkdown"] div.hh-log-row)
+        + div[data-testid="stLayoutWrapper"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:nth-child(3) {
+        flex: 0.7 0 70px !important; min-width: 70px !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div[data-testid="stMarkdown"] div.hh-log-row)
+        + div[data-testid="stLayoutWrapper"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:nth-child(4) {
+        flex: 1.1 0 110px !important; min-width: 110px !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div[data-testid="stMarkdown"] div.hh-log-row)
+        + div[data-testid="stLayoutWrapper"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:nth-child(5) {
+        flex: 1.3 0 130px !important; min-width: 130px !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div[data-testid="stMarkdown"] div.hh-log-row)
+        + div[data-testid="stLayoutWrapper"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:nth-child(6) {
+        flex: 1.3 0 130px !important; min-width: 130px !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div[data-testid="stMarkdown"] div.hh-log-row)
+        + div[data-testid="stLayoutWrapper"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:nth-child(7) {
+        flex: 0.8 0 80px !important; min-width: 80px !important;
+    }
+    div[data-testid="stElementContainer"]:has(> div[data-testid="stMarkdown"] div.hh-log-row)
+        + div[data-testid="stLayoutWrapper"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:nth-child(8) {
+        flex: 0.9 0 90px !important; min-width: 90px !important;
+    }
+    .st-key-hh_game_log_container {
+        overflow-x: auto;
+    }
     </style>
     <h1 style='text-align: center;'>The Dynasty Historical Register</h1>
     """,
@@ -1888,6 +1945,7 @@ with tab_h2h:
                 # edge-most columns). This trades away the header's
                 # seamless background (small gaps reappear between cells,
                 # matching the data rows) for guaranteed alignment.
+                st.markdown('<div class="hh-log-row"></div>', unsafe_allow_html=True)
                 for col, label in zip(st.columns(hh_log_widths), hh_log_headers):
                     col.markdown(
                         "<div style='text-align:center; font-weight:600; padding:8px 12px; "
@@ -1899,6 +1957,7 @@ with tab_h2h:
                 hh_row_cell_style = "text-align:center;"
                 hh_result_label = {"team1": "Win", "team2": "Loss", "tie": "Tie"}
                 for hh_row_idx, hh_row in hh_matchup.iterrows():
+                    st.markdown('<div class="hh-log-row"></div>', unsafe_allow_html=True)
                     row_cols = st.columns(hh_log_widths, vertical_alignment="center")
                     hh_row_key = f"hh_log_select_{hh_row_idx}_{hh_row['year']}_{hh_row['week']}"
                     # Nested columns (spacer / checkbox / spacer) center the
