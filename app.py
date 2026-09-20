@@ -91,18 +91,29 @@ def load_champions():
 
 @st.cache_data(ttl=600)
 def load_draft_picks():
+    """d.original_roster is unreliable as a name source: sleeper_to_db.py
+    resolves it to a display name at ingest time, but update_sleeper_draft.py
+    (the ad hoc rookie-draft sync script) writes it as a bare roster_id
+    string, and it's simply NULL for the pre-Sleeper 2014-2016 era -- so
+    joining it against owners.username (a real username/display-name column)
+    essentially never matches. team_id (the roster that actually made the
+    pick) is populated consistently across every era and joins cleanly
+    against teams/owners like everywhere else in this app.
+    """
     conn = get_connection()
     query = """
-        SELECT 
+        SELECT
             d.year,
             d.round,
             d.pick_no,
             d.player_name,
             d.position,
             d.nfl_team,
-            COALESCE(o.real_name, d.original_roster) AS drafted_by
+            d.team_id,
+            COALESCE(o.real_name, t.owner) AS drafted_by
         FROM draft_picks d
-        LEFT JOIN owners o ON d.original_roster = o.username
+        LEFT JOIN teams t ON d.year = t.year AND d.team_id = t.team_id
+        LEFT JOIN owners o ON t.owner = o.username
         ORDER BY d.year DESC, d.round ASC, d.pick_no ASC;
     """
     df = pd.read_sql_query(query, conn)
@@ -313,6 +324,24 @@ def load_live_games_detail():
     merged = resolve_manager_names(merged)
 
     return merged[columns]
+
+
+@st.cache_data(ttl=300)
+def load_live_team_owner_map():
+    """team_id -> manager_name for whatever Sleeper season is currently in
+    progress, used by the Draft History tab to resolve the Manager column
+    for a season whose draft has happened but whose `teams` table row
+    doesn't exist yet (sleeper_to_db.py, which populates `teams`, hasn't
+    run for it). Cached separately from load_live_games_detail() -- and
+    with its own ttl, same as every other live-data call in this app --
+    so this (multi-request) Sleeper fetch doesn't re-run on every widget
+    interaction on the Draft History tab.
+    """
+    live_teams = sleeper_live.get_live_season_data()["teams"]
+    if live_teams.empty:
+        return pd.Series(dtype=object)
+    resolved = resolve_manager_names(live_teams.rename(columns={"owner": "manager_name"}))
+    return resolved.set_index("team_id")["manager_name"]
 
 
 # --- UI & Layout ---
@@ -1842,7 +1871,7 @@ with tab_h2h:
                 color=alt.Color(
                     "segment:N",
                     scale=alt.Scale(domain=hh_bar_domain, range=hh_bar_range),
-                    legend=alt.Legend(title=None),
+                    legend=alt.Legend(title=None, orient="top", direction="horizontal"),
                 ),
                 tooltip=[
                     alt.Tooltip("game_label:N", title="Game"),
@@ -2117,6 +2146,17 @@ with tab_h2h:
 # --- TAB: Draft History ---
 with tab_draft:
     draft_df = load_draft_picks()
+    if draft_df["drafted_by"].isna().any():
+        # Only the current season's picks can hit this -- its teams row
+        # doesn't exist yet because sleeper_to_db.py (which populates
+        # `teams`) hasn't run for it, typically because the season is still
+        # in its rookie-draft/pre-season phase.
+        try:
+            live_owner_map = load_live_team_owner_map()
+            missing = draft_df["drafted_by"].isna()
+            draft_df.loc[missing, "drafted_by"] = draft_df.loc[missing, "team_id"].map(live_owner_map)
+        except Exception as e:
+            st.warning(f"Couldn't fetch live team data from Sleeper: {e}")
     if not draft_df.empty:
         draft_years = sorted(draft_df["year"].unique(), reverse=True)
         selected_draft_year = st.selectbox("Select Draft Season", draft_years, key="draft_year")
