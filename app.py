@@ -74,14 +74,27 @@ def load_manager_efficiency():
 
 @st.cache_data(ttl=600)
 def load_champions():
+    """One row per year's champion, plus enough to jump straight to that
+    year's championship-game box score (team ids + week) -- the week isn't
+    on the champions table itself, so it's picked up from playoff_results'
+    round='Championship' row for the champion's team.
+    """
     conn = get_connection()
     query = """
         SELECT
             c.year,
-            COALESCE(o.real_name, t.owner) AS champion_name
+            c.champion_team_id,
+            c.runner_up_team_id,
+            COALESCE(o.real_name, t.owner) AS champion_name,
+            COALESCE(ro.real_name, rt.owner) AS runner_up_name,
+            pr.week
         FROM champions c
         JOIN teams t ON c.year = t.year AND c.champion_team_id = t.team_id
         LEFT JOIN owners o ON t.owner = o.username
+        JOIN teams rt ON c.year = rt.year AND c.runner_up_team_id = rt.team_id
+        LEFT JOIN owners ro ON rt.owner = ro.username
+        LEFT JOIN playoff_results pr
+            ON pr.year = c.year AND pr.team_id = c.champion_team_id AND pr.round = 'Championship'
         ORDER BY c.year;
     """
     df = pd.read_sql_query(query, conn)
@@ -140,6 +153,47 @@ def load_expansion_draft():
     df = pd.read_sql_query(query, conn)
     conn.close()
     return df
+
+
+@st.cache_data(ttl=600)
+def load_owner_years():
+    """One row per (owner, year) they fielded a team -- the raw material for
+    the League Members timeline. Distinct because a manager can hold more
+    than one team_id across seasons (and multiple owners occasionally
+    co-existed under slightly different teams.owner spellings, which
+    `owners` already collapses via real_name).
+    """
+    conn = get_connection()
+    query = """
+        SELECT DISTINCT t.year, COALESCE(o.real_name, t.owner) AS manager_name
+        FROM teams t
+        LEFT JOIN owners o ON t.owner = o.username
+        ORDER BY manager_name, t.year;
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+def owner_tenure_segments(owner_years_df: pd.DataFrame) -> pd.DataFrame:
+    """Collapses each owner's set of years into contiguous [start, end]
+    segments -- most owners have one, but this holds up if someone ever
+    leaves the league and comes back rather than assuming one unbroken run.
+    end is exclusive (last_year + 1) so a bar for a single year still draws
+    a visible width on a year-scale x-axis.
+    """
+    segments = []
+    for manager_name, group in owner_years_df.groupby("manager_name"):
+        years = sorted(group["year"].unique())
+        seg_start = years[0]
+        prev = years[0]
+        for year in years[1:]:
+            if year != prev + 1:
+                segments.append({"manager_name": manager_name, "start": seg_start, "end": prev + 1})
+                seg_start = year
+            prev = year
+        segments.append({"manager_name": manager_name, "start": seg_start, "end": prev + 1})
+    return pd.DataFrame(segments, columns=["manager_name", "start", "end"])
 
 
 @st.cache_data(ttl=600)
@@ -445,6 +499,7 @@ st.markdown(
     tab_h2h,
     tab_draft,
     tab_expansion,
+    tab_members,
 ) = st.tabs(
     [
         "Yearly Summary",
@@ -454,6 +509,7 @@ st.markdown(
         "Head-to-Head Records",
         "Draft History",
         "Expansion Draft",
+        "League Members",
     ]
 )
 
@@ -553,7 +609,9 @@ def render_centered_table(df: pd.DataFrame):
 
 with tab_standings:
     champions_df = load_champions()
-    if not champions_df.empty:
+    champ_view_active = st.session_state.get("champ_view") == "game_detail"
+
+    if not champ_view_active and not champions_df.empty:
         st.markdown(
             "<h3 style='text-align:center'><strong><em>Champions</em></strong></h3>",
             unsafe_allow_html=True,
@@ -563,13 +621,29 @@ with tab_standings:
             with col:
                 st.markdown(
                     f"<div style='text-align:center'>"
-                    f"<div style='font-weight:600'>{row['year']}</div>"
-                    f"<div style='font-size:0.85em'>{row['champion_name']}</div>"
+                    f"<div style='font-weight:600; font-size:1.3em'>{row['year']}</div>"
+                    f"<div style='font-size:1.05em'>{row['champion_name']}</div>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
+                # Same click-to-view-game-detail affordance as the
+                # Head-to-Head Game Log: a small centered checkbox that
+                # navigates on select rather than a full button, to stay
+                # visually out of the way of the compact per-year layout.
+                champ_row_key = f"champ_select_{row['year']}"
+                _, champ_checkbox_col, _ = st.columns([1, 0.3, 1])
+                with champ_checkbox_col:
+                    champ_selected = st.checkbox(
+                        "View game", key=champ_row_key, label_visibility="collapsed"
+                    )
+                if champ_selected:
+                    del st.session_state[champ_row_key]
+                    st.session_state["champ_view"] = "game_detail"
+                    st.session_state["champ_game_year"] = int(row["year"])
+                    st.rerun()
         st.divider()
 
+def render_standings_tab_body():
     standings_df = load_standings()
     game_results_df = load_game_results()
 
@@ -826,6 +900,10 @@ with tab_standings:
                 st.info("No head-to-head data available for this season.")
     else:
         st.info("No standings records found in the database.")
+
+if not champ_view_active:
+    with tab_standings:
+        render_standings_tab_body()
 
 # --- TAB: Manager Efficiency ---
 with tab_eff:
@@ -1628,6 +1706,96 @@ def load_combined_game_efficiency(year, week, team_id):
     return df
 
 
+def render_game_box_score(team1_name, team1_id, team2_name, team2_id, year, week):
+    """Two-column starters/bench box score for one game -- shared by the
+    Head-to-Head Game Log's game-detail view and the Champions row's
+    click-to-view-game affordance on the Yearly Summary tab.
+    """
+    if year is not None and year <= 2016:
+        st.info(
+            "No per-player lineup data exists for 2014-2016 (NFL.com era) -- "
+            "see CLAUDE.md's data-era notes."
+        )
+        return
+
+    if year == 2017:
+        st.warning(
+            "2017 lineup slot data is known to be corrupted (every row reads 'QB' "
+            "regardless of actual slot), so the starters/bench split below may not "
+            "be accurate for this game."
+        )
+
+    def render_team_lineup(container, team_name, team_id):
+        with container:
+            st.markdown(f"<div style='text-align:center;'><strong>{team_name}</strong></div>", unsafe_allow_html=True)
+            lineup = load_combined_game_lineup(year, week, team_id)
+            efficiency = load_combined_game_efficiency(year, week, team_id)
+
+            if not efficiency.empty:
+                eff_row = efficiency.iloc[0]
+                st.markdown(
+                    "<div style='text-align:center; font-size:0.85rem; opacity:0.7;'>"
+                    f"Actual: {eff_row['actual_score']:.2f} · "
+                    f"Optimal: {eff_row['optimal_score']:.2f} · "
+                    f"Efficiency: {eff_row['efficiency_pct']:.2f}%"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            if lineup.empty:
+                st.info("No lineup data available for this game.")
+                return
+
+            starters = lineup[~lineup["player_slot_position"].isin(BENCH_SLOTS)].copy()
+            starters["_slot_rank"] = starters["player_slot_position"].map(starter_slot_rank)
+            starters = starters.sort_values("_slot_rank", kind="mergesort").drop(columns="_slot_rank")
+            bench = lineup[lineup["player_slot_position"].isin(BENCH_SLOTS)].copy()
+            bench["_slot_rank"] = bench["player_slot_position"].map(bench_slot_rank)
+            bench = bench.sort_values("_slot_rank", kind="mergesort").drop(columns="_slot_rank")
+
+            for section_title, section_df in [("Starters", starters), ("Bench", bench)]:
+                st.markdown(f"<div style='text-align:center;'><em>{section_title}</em></div>", unsafe_allow_html=True)
+                if section_df.empty:
+                    st.caption("None")
+                    continue
+                display_df = section_df.rename(columns={
+                    "player_name": "Player",
+                    "player_position": "Position",
+                    "player_slot_position": "Slot",
+                    "player_score": "Points",
+                })
+                display_df = comma_format(display_df, ["Points"])
+                render_centered_table(display_df[["Player", "Position", "Slot", "Points"]])
+
+    box_col1, box_col2 = st.columns(2)
+    render_team_lineup(box_col1, team1_name, team1_id)
+    render_team_lineup(box_col2, team2_name, team2_id)
+
+
+if champ_view_active:
+    with tab_standings:
+        if st.button("← Back to Yearly Summary", key="champ_back_button"):
+            del st.session_state["champ_view"]
+            # The checkbox that navigated here stays checked in session_state
+            # (unlike the Game Log's, which deletes its own key the moment
+            # it's ticked) since this button is a separate widget -- clear it
+            # here so the entry isn't stuck looking selected on return.
+            st.session_state.pop(f"champ_select_{st.session_state['champ_game_year']}", None)
+            st.rerun()
+
+        champ_row = champions_df[champions_df["year"] == st.session_state["champ_game_year"]].iloc[0]
+        st.markdown(
+            f"<h3 style='text-align:center'>{champ_row['champion_name']} vs {champ_row['runner_up_name']} "
+            f"— {int(champ_row['year'])} Championship (Week {int(champ_row['week'])})</h3>",
+            unsafe_allow_html=True,
+        )
+        render_game_box_score(
+            champ_row["champion_name"], int(champ_row["champion_team_id"]),
+            champ_row["runner_up_name"], int(champ_row["runner_up_team_id"]),
+            int(champ_row["year"]), int(champ_row["week"]),
+        )
+
+
 # --- TAB: Head-to-Head Records ---
 with tab_h2h:
     if st.session_state.get("hh_view") == "game_detail":
@@ -1647,64 +1815,7 @@ with tab_h2h:
             unsafe_allow_html=True,
         )
 
-        if hh_gd_year is not None and hh_gd_year <= 2016:
-            st.info(
-                "No per-player lineup data exists for 2014-2016 (NFL.com era) -- "
-                "see CLAUDE.md's data-era notes."
-            )
-        else:
-            if hh_gd_year == 2017:
-                st.warning(
-                    "2017 lineup slot data is known to be corrupted (every row reads 'QB' "
-                    "regardless of actual slot), so the starters/bench split below may not "
-                    "be accurate for this game."
-                )
-
-            def hh_render_team_lineup(container, team_name, team_id):
-                with container:
-                    st.markdown(f"<div style='text-align:center;'><strong>{team_name}</strong></div>", unsafe_allow_html=True)
-                    lineup = load_combined_game_lineup(hh_gd_year, hh_gd_week, team_id)
-                    efficiency = load_combined_game_efficiency(hh_gd_year, hh_gd_week, team_id)
-
-                    if not efficiency.empty:
-                        eff_row = efficiency.iloc[0]
-                        st.markdown(
-                            "<div style='text-align:center; font-size:0.85rem; opacity:0.7;'>"
-                            f"Actual: {eff_row['actual_score']:.2f} · "
-                            f"Optimal: {eff_row['optimal_score']:.2f} · "
-                            f"Efficiency: {eff_row['efficiency_pct']:.2f}%"
-                            "</div>",
-                            unsafe_allow_html=True,
-                        )
-
-                    if lineup.empty:
-                        st.info("No lineup data available for this game.")
-                        return
-
-                    starters = lineup[~lineup["player_slot_position"].isin(BENCH_SLOTS)].copy()
-                    starters["_slot_rank"] = starters["player_slot_position"].map(starter_slot_rank)
-                    starters = starters.sort_values("_slot_rank", kind="mergesort").drop(columns="_slot_rank")
-                    bench = lineup[lineup["player_slot_position"].isin(BENCH_SLOTS)].copy()
-                    bench["_slot_rank"] = bench["player_slot_position"].map(bench_slot_rank)
-                    bench = bench.sort_values("_slot_rank", kind="mergesort").drop(columns="_slot_rank")
-
-                    for section_title, section_df in [("Starters", starters), ("Bench", bench)]:
-                        st.markdown(f"<div style='text-align:center;'><em>{section_title}</em></div>", unsafe_allow_html=True)
-                        if section_df.empty:
-                            st.caption("None")
-                            continue
-                        display_df = section_df.rename(columns={
-                            "player_name": "Player",
-                            "player_position": "Position",
-                            "player_slot_position": "Slot",
-                            "player_score": "Points",
-                        })
-                        display_df = comma_format(display_df, ["Points"])
-                        render_centered_table(display_df[["Player", "Position", "Slot", "Points"]])
-
-            hh_gd_col1, hh_gd_col2 = st.columns(2)
-            hh_render_team_lineup(hh_gd_col1, hh_gd_team1, hh_gd_team1_id)
-            hh_render_team_lineup(hh_gd_col2, hh_gd_team2, hh_gd_team2_id)
+        render_game_box_score(hh_gd_team1, hh_gd_team1_id, hh_gd_team2, hh_gd_team2_id, hh_gd_year, hh_gd_week)
     elif st.session_state.get("hh_view") == "detail":
         hh_detail_team1 = st.session_state.get("hh_detail_team1")
         hh_detail_team2 = st.session_state.get("hh_detail_team2")
@@ -2210,3 +2321,80 @@ with tab_expansion:
         )
     else:
         st.info("No expansion draft records found in the database.")
+
+# --- TAB: League Members ---
+with tab_members:
+    owner_years_df = load_owner_years()
+
+    try:
+        live_standings_df, _, live_meta = load_live_season_data()
+        if live_meta and not live_standings_df.empty and live_meta["year"] not in owner_years_df["year"].values:
+            live_owner_rows = pd.DataFrame({
+                "year": live_meta["year"],
+                "manager_name": live_standings_df["manager_name"].unique(),
+            })
+            owner_years_df = pd.concat([owner_years_df, live_owner_rows], ignore_index=True)
+    except Exception as e:
+        st.warning(f"Couldn't fetch live team data from Sleeper: {e}")
+
+    if owner_years_df.empty:
+        st.info("No league membership records found in the database.")
+    else:
+        segments_df = owner_tenure_segments(owner_years_df)
+        segments_df["seasons"] = segments_df["end"] - segments_df["start"]
+        segments_df["label"] = segments_df.apply(
+            lambda r: str(r["start"]) if r["seasons"] == 1 else f"{r['start']}–{r['end'] - 1}",
+            axis=1,
+        )
+
+        # A segment is only "Active" if it's the one reaching the most
+        # recent season on record -- an owner's earlier (pre-gap) segments,
+        # if they ever have one, are past tenures regardless.
+        current_year = owner_years_df["year"].max()
+        segments_df["status"] = segments_df["end"].apply(
+            lambda end: "Active" if end - 1 == current_year else "Inactive"
+        )
+
+        # Earliest-joining owner at the top, matching the reference timeline
+        # (founding members first); ties broken alphabetically via the
+        # stable sort's input order (groupby already yields that order).
+        member_order = (
+            segments_df.groupby("manager_name")["start"].min()
+            .sort_values(kind="mergesort")
+            .index.tolist()
+        )
+
+        st.markdown(
+            "<h3 style='text-align:center'><strong><em>League Members</em></strong></h3>",
+            unsafe_allow_html=True,
+        )
+
+        # Color carries status (active vs. inactive), not per-owner identity
+        # -- identity already comes from the y-axis label, so a per-owner
+        # rainbow across 17+ names would just be noise (and blow well past
+        # the categorical palette's safe ceiling).
+        members_chart = (
+            alt.Chart(segments_df)
+            .mark_bar(cornerRadius=4, size=16)
+            .encode(
+                x=alt.X(
+                    "start:Q", title=None,
+                    scale=alt.Scale(zero=False),
+                    axis=alt.Axis(format="d", grid=False),
+                ),
+                x2="end:Q",
+                y=alt.Y("manager_name:N", title=None, sort=member_order),
+                color=alt.Color(
+                    "status:N",
+                    scale=alt.Scale(domain=["Active", "Inactive"], range=["#2a78d6", "#8B0000"]),
+                    legend=alt.Legend(title=None, orient="top", direction="horizontal"),
+                ),
+                tooltip=[
+                    alt.Tooltip("manager_name:N", title="Owner"),
+                    alt.Tooltip("label:N", title="Seasons"),
+                    alt.Tooltip("status:N", title="Status"),
+                ],
+            )
+            .properties(height=max(320, 28 * len(member_order)))
+        )
+        st.altair_chart(members_chart, width="stretch")
