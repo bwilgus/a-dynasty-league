@@ -348,7 +348,15 @@ def load_live_team_owner_map():
 st.markdown(
     """
     <style>
-    div[data-baseweb="tab-list"] {
+    /* Streamlit has migrated st.tabs() between at least two underlying
+       implementations -- older versions render div[data-baseweb="tab-list"]
+       (BaseWeb), newer ones render a react-aria div[role="tablist"] with no
+       data-baseweb attribute at all. Target both so this doesn't silently
+       stop working next time Streamlit swaps the internals again (this is
+       exactly how it broke: it worked locally on an older pinned install
+       while Cloud's unpinned build picked up the newer one). */
+    div[data-baseweb="tab-list"],
+    div[data-testid="stTabs"] div[role="tablist"] {
         justify-content: center;
     }
     table.standings-table {
