@@ -1857,45 +1857,87 @@ with tab_h2h:
             st.divider()
 
             st.markdown('<div id="hh-game-log"></div>', unsafe_allow_html=True)
-            st.markdown("<div style='text-align:center;'><strong>Game Log</strong></div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div style='text-align:center; font-size:1.4rem;'><strong>Game Log</strong></div>",
+                unsafe_allow_html=True,
+            )
 
-            hh_log_widths = [0.7, 0.7, 1.1, 1.3, 1.3, 0.8, 1.1]
+            # A custom table (header + rows built from st.columns) rather
+            # than st.dataframe -- st.dataframe's grid renderer has no
+            # column_config or other option to center cell/header text (its
+            # own default alignment is fixed), so full alignment control
+            # means laying the table out ourselves. Selection is a per-row
+            # checkbox instead of st.dataframe's native selection gutter.
+            st.markdown(
+                "<div style='text-align:center; font-size:1.1rem; opacity:0.7; margin-bottom:1rem;'>"
+                "Click the lefthand box to view game details.</div>",
+                unsafe_allow_html=True,
+            )
+
+            hh_log_widths = [0.9, 0.7, 0.7, 1.1, 1.3, 1.3, 0.8, 0.9]
             hh_log_headers = [
-                "Year", "Week", "Playoff Game?",
-                f"{hh_detail_team1} Points", f"{hh_detail_team2} Points", "Result", "",
+                "Game Details", "Year", "Week", "Playoff Game?",
+                f"{hh_detail_team1} Points", f"{hh_detail_team2} Points", "Result", "Margin",
             ]
-            with st.container(border=True):
+            with st.container(border=True, key="hh_game_log_container"):
+                # Rendered via the same st.columns(hh_log_widths) mechanism
+                # as the data rows below, rather than one custom flex div --
+                # a raw CSS flexbox with zero gap and st.columns' own
+                # internal column gap distribute width differently, so the
+                # two never matched pixel-for-pixel (worst on the narrowest,
+                # edge-most columns). This trades away the header's
+                # seamless background (small gaps reappear between cells,
+                # matching the data rows) for guaranteed alignment.
                 for col, label in zip(st.columns(hh_log_widths), hh_log_headers):
-                    col.markdown(f"<div style='text-align:center; font-weight:600;'>{label}</div>", unsafe_allow_html=True)
+                    col.markdown(
+                        "<div style='text-align:center; font-weight:600; padding:8px 12px; "
+                        "background-color:rgba(255,255,255,0.08); "
+                        f"border-bottom:1px solid rgba(255,255,255,0.3);'>{label}</div>",
+                        unsafe_allow_html=True,
+                    )
 
+                hh_row_cell_style = "text-align:center;"
                 hh_result_label = {"team1": "Win", "team2": "Loss", "tie": "Tie"}
                 for hh_row_idx, hh_row in hh_matchup.iterrows():
-                    row_cols = st.columns(hh_log_widths)
-                    row_cols[0].markdown(
-                        f"<div style='text-align:center;'>{int(hh_row['year'])}</div>", unsafe_allow_html=True
-                    )
+                    row_cols = st.columns(hh_log_widths, vertical_alignment="center")
+                    hh_row_key = f"hh_log_select_{hh_row_idx}_{hh_row['year']}_{hh_row['week']}"
+                    # Nested columns (spacer / checkbox / spacer) center the
+                    # checkbox using only Streamlit's own native layout,
+                    # rather than a CSS selector targeting Streamlit's
+                    # internal DOM structure from the outside -- the CSS
+                    # approach tried previously never took effect.
+                    with row_cols[0]:
+                        _, hh_checkbox_col, _ = st.columns([1, 0.3, 1])
+                        with hh_checkbox_col:
+                            hh_row_selected = st.checkbox(
+                                "Select", key=hh_row_key, label_visibility="collapsed"
+                            )
                     row_cols[1].markdown(
-                        f"<div style='text-align:center;'>{int(hh_row['week'])}</div>", unsafe_allow_html=True
+                        f"<div style='{hh_row_cell_style}'>{int(hh_row['year'])}</div>", unsafe_allow_html=True
                     )
                     row_cols[2].markdown(
-                        f"<div style='text-align:center;'>{'Yes' if hh_row['is_playoff'] else 'No'}</div>",
-                        unsafe_allow_html=True,
+                        f"<div style='{hh_row_cell_style}'>{int(hh_row['week'])}</div>", unsafe_allow_html=True
                     )
                     row_cols[3].markdown(
-                        f"<div style='text-align:center;'>{hh_row['team_score']:,.2f}</div>", unsafe_allow_html=True
+                        f"<div style='{hh_row_cell_style}'>{'Yes' if hh_row['is_playoff'] else 'No'}</div>",
+                        unsafe_allow_html=True,
                     )
                     row_cols[4].markdown(
-                        f"<div style='text-align:center;'>{hh_row['opponent_score']:,.2f}</div>",
-                        unsafe_allow_html=True,
+                        f"<div style='{hh_row_cell_style}'>{hh_row['team_score']:,.2f}</div>", unsafe_allow_html=True
                     )
                     row_cols[5].markdown(
-                        f"<div style='text-align:center;'>{hh_result_label[hh_row['result']]}</div>",
+                        f"<div style='{hh_row_cell_style}'>{hh_row['opponent_score']:,.2f}</div>",
                         unsafe_allow_html=True,
                     )
-                    if row_cols[6].button(
-                        "Details", key=f"hh_game_detail_{hh_row_idx}_{hh_row['year']}_{hh_row['week']}",
-                        use_container_width=True,
-                    ):
+                    row_cols[6].markdown(
+                        f"<div style='{hh_row_cell_style}'>{hh_result_label[hh_row['result']]}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    row_cols[7].markdown(
+                        f"<div style='{hh_row_cell_style}'>{hh_row['margin']:,.2f}</div>", unsafe_allow_html=True
+                    )
+                    if hh_row_selected:
+                        del st.session_state[hh_row_key]
                         st.session_state["hh_view"] = "game_detail"
                         st.session_state["hh_game_year"] = int(hh_row["year"])
                         st.session_state["hh_game_week"] = int(hh_row["week"])
